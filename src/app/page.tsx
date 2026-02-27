@@ -3,7 +3,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import * as XLSX from "xlsx";
-
 import { createClient } from "@/app/lib/supabase/client";
 import { computeRows, type TrackerRow } from "./libcompute";
 
@@ -47,8 +46,8 @@ function inferDailyAttritionPct(onHand: number, destroyedByDay: number[], day: n
   const byDay = normalizeDestroyedByDay(destroyedByDay);
   const cumDestroyed = byDay.slice(0, d).reduce((s, v) => s + v, 0);
   const remaining = Math.max(0, oh - cumDestroyed);
-
   const frac = remaining / oh;
+
   if (frac <= 0) return 100;
   if (frac >= 1) return 0;
 
@@ -66,6 +65,11 @@ function newRow(day: number): TrackerRow {
     destroyedByDay,
     dailyAttritionPct: inferDailyAttritionPct(0, destroyedByDay, day),
   };
+}
+
+function is165BcgUnit(bn: any) {
+  const s = String(bn ?? "").trim().toUpperCase();
+  return s.startsWith("165") || s.startsWith("OS");
 }
 
 type TrackerState = {
@@ -105,6 +109,71 @@ const DEFAULT_STATE: TrackerState = {
   ],
 };
 
+type SortMode = "BN_ASC" | "BN_DESC" | "CP_ASC" | "CP_DESC";
+
+function cycleSort(mode: SortMode): SortMode {
+  if (mode === "BN_ASC") return "BN_DESC";
+  if (mode === "BN_DESC") return "CP_DESC";
+  if (mode === "CP_DESC") return "CP_ASC";
+  return "BN_ASC";
+}
+
+function sortLabel(mode: SortMode) {
+  switch (mode) {
+    case "BN_ASC":
+      return "BN ↑";
+    case "BN_DESC":
+      return "BN ↓";
+    case "CP_ASC":
+      return "CP ↑";
+    case "CP_DESC":
+      return "CP ↓";
+  }
+}
+
+function formatLastUpdated(iso?: string | null) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString();
+}
+
+function safeParseState(st: any): Partial<TrackerState> {
+  if (!st || typeof st !== "object") return {};
+  return st as Partial<TrackerState>;
+}
+
+function normalizeLoadedState(st: Partial<TrackerState>) {
+  const nextDay = clampInt(st.day ?? 1, 1, 5);
+  const nextUse = Boolean(st.useAttrition ?? true);
+  const nextRows = Array.isArray(st.rows) ? (st.rows as TrackerRow[]) : [];
+
+  const normalizedRows = nextRows.map((r) => {
+    const byDay = normalizeDestroyedByDay((r as any).destroyedByDay);
+    const onHand = Number((r as any).onHand) || 0;
+
+    return {
+      ...r,
+      id: (r as any).id || crypto.randomUUID(),
+      bn: String((r as any).bn || ""),
+      equipmentType: String((r as any).equipmentType || ""),
+      onHand,
+      destroyedByDay: byDay,
+      dailyAttritionPct: inferDailyAttritionPct(onHand, byDay, nextDay),
+    } as TrackerRow;
+  });
+
+  return { day: nextDay, useAttrition: nextUse, rows: normalizedRows } as TrackerState;
+}
+
+type HistoryRow = {
+  id: number;
+  tracker_id: number;
+  state: any;
+  saved_at: string;
+  saved_by_email: string | null;
+};
+
 export default function Home() {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
@@ -114,9 +183,44 @@ export default function Home() {
   const [rows, setRows] = useState<TrackerRow[]>(DEFAULT_STATE.rows);
 
   const [isDragging, setIsDragging] = useState(false);
-
   const [isAuthed, setIsAuthed] = useState<boolean>(false);
   const [status, setStatus] = useState<string>("");
+
+  // Search + sort + last-updated display
+  const [query, setQuery] = useState<string>("");
+  const [sortMode, setSortMode] = useState<SortMode>("BN_ASC");
+
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [lastUpdatedBy, setLastUpdatedBy] = useState<string | null>(null);
+
+  // History UI
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [history, setHistory] = useState<HistoryRow[]>([]);
+
+  // Throttle history snapshots (autosave can be frequent)
+  const lastHistoryWriteAtRef = useRef<number>(0);
+
+  async function loadHistory() {
+    if (!isAuthed) return;
+    setHistoryBusy(true);
+    try {
+      const { data, error } = await supabase
+        .from("global_tracker_state_history")
+        .select("id, tracker_id, state, saved_at, saved_by_email")
+        .eq("tracker_id", 1)
+        .order("saved_at", { ascending: false })
+        .limit(25);
+
+      if (error) {
+        setStatus(`History load failed: ${error.message}`);
+        return;
+      }
+      setHistory((data ?? []) as HistoryRow[]);
+    } finally {
+      setHistoryBusy(false);
+    }
+  }
 
   // ---- LOAD on mount ----
   useEffect(() => {
@@ -134,7 +238,7 @@ export default function Home() {
 
       const { data, error } = await supabase
         .from("global_tracker_state")
-        .select("state")
+        .select("state, updated_at, updated_by_email")
         .eq("id", 1)
         .maybeSingle();
 
@@ -143,54 +247,25 @@ export default function Home() {
         return;
       }
 
+      setLastUpdatedAt((data as any)?.updated_at ?? null);
+      setLastUpdatedBy((data as any)?.updated_by_email ?? null);
+
       if (!data?.state) {
         setStatus("No global state yet.");
+        await loadHistory();
         return;
       }
 
-      const st = data.state as Partial<TrackerState>;
-      const nextDay = clampInt(st.day ?? 1, 1, 5);
-      const nextUse = Boolean(st.useAttrition ?? true);
-      const nextRows = Array.isArray(st.rows) ? (st.rows as TrackerRow[]) : [];
+      const st = normalizeLoadedState(safeParseState(data.state));
+      setDay(st.day);
+      setUseAttrition(st.useAttrition);
+      setRows(st.rows);
 
-      const normalizedRows = nextRows.map((r) => {
-        const byDay = normalizeDestroyedByDay(r.destroyedByDay);
-        const onHand = Number((r as any).onHand) || 0;
-        return {
-          ...r,
-          id: (r as any).id || crypto.randomUUID(),
-          bn: String((r as any).bn || ""),
-          equipmentType: String((r as any).equipmentType || ""),
-          onHand,
-          destroyedByDay: byDay,
-          dailyAttritionPct: inferDailyAttritionPct(onHand, byDay, nextDay),
-        };
-      });
-
-      setDay(nextDay);
-      setUseAttrition(nextUse);
-      setRows(normalizedRows);
       setStatus("Loaded global tracker.");
+      await loadHistory();
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // ---- compute ----
-  const { bnSummaries, computedRows } = useMemo(
-    () => computeRows(rows, { day, useAttrition, manualWins: true }),
-    [rows, day, useAttrition]
-  );
-
-  const bcgTotals = useMemo(() => {
-    const onHand = computedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
-    const remaining = computedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
-    const destroyed = computedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
-    const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
-    return { onHand, remaining, destroyed, combatPowerPct };
-  }, [computedRows]);
-
-  const bcgRemPct = bcgTotals.onHand > 0 ? (bcgTotals.remaining / bcgTotals.onHand) * 100 : 0;
-  const bcgDesPct = bcgTotals.onHand > 0 ? (bcgTotals.destroyed / bcgTotals.onHand) * 100 : 0;
 
   // ---- setters that keep attrition inference consistent ----
   function setDayAndRecalc(nextDay: number | string) {
@@ -233,57 +308,200 @@ export default function Home() {
     setRows((prev) => prev.filter((r) => r.id !== id));
   }
 
-  // ---- SAVE ----
-  async function saveNow() {
+  // ---- Filter rows for display + compute ----
+  const filteredInputRows = useMemo(() => {
+    const q = normalizeKey(query);
+    if (!q) return rows;
+    return rows.filter((r) => {
+      const hay = normalizeKey(`${r.bn ?? ""} ${r.equipmentType ?? ""}`);
+      return hay.includes(q);
+    });
+  }, [rows, query]);
+
+  // ---- compute (based on filtered rows so search affects summaries/bars/computed) ----
+  const { bnSummaries, computedRows } = useMemo(
+    () => computeRows(filteredInputRows, { day, useAttrition, manualWins: true }),
+    [filteredInputRows, day, useAttrition]
+  );
+
+  // ---- 165 BCG-only totals for the top bar ----
+  const bcgComputedRows = useMemo(() => {
+    return computedRows.filter((r) => is165BcgUnit(r.bn));
+  }, [computedRows]);
+
+  const bcgTotals = useMemo(() => {
+    const onHand = bcgComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
+    const remaining = bcgComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
+    const destroyed = bcgComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
+    const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
+    return { onHand, remaining, destroyed, combatPowerPct };
+  }, [bcgComputedRows]);
+
+  const bcgRemPct = bcgTotals.onHand > 0 ? (bcgTotals.remaining / bcgTotals.onHand) * 100 : 0;
+  const bcgDesPct = bcgTotals.onHand > 0 ? (bcgTotals.destroyed / bcgTotals.onHand) * 100 : 0;
+
+  // ---- Split BN summaries into 165-group and other units (bars by unit) ----
+  const otherUnitSummaries = useMemo(() => {
+    return bnSummaries.filter((bn) => !is165BcgUnit(bn.bn));
+  }, [bnSummaries]);
+
+  // ---- Sort helpers ----
+  function sortSummaries(list: typeof bnSummaries) {
+    const arr = [...list];
+    if (sortMode === "BN_ASC") arr.sort((a, b) => String(a.bn).localeCompare(String(b.bn)));
+    else if (sortMode === "BN_DESC") arr.sort((a, b) => String(b.bn).localeCompare(String(a.bn)));
+    else if (sortMode === "CP_ASC")
+      arr.sort(
+        (a, b) =>
+          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+      );
+    else
+      arr.sort(
+        (a, b) =>
+          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+      );
+    return arr;
+  }
+
+  const sortedBnSummaries = useMemo(() => sortSummaries(bnSummaries), [bnSummaries, sortMode]);
+  const sortedOtherUnitSummaries = useMemo(() => sortSummaries(otherUnitSummaries), [otherUnitSummaries, sortMode]);
+
+  async function writeHistorySnapshot(stateToSave: TrackerState, email: string | null, userId: string | null) {
+    const { error } = await supabase.from("global_tracker_state_history").insert({
+      tracker_id: 1,
+      state: stateToSave,
+      saved_by_email: email,
+      saved_by_user_id: userId,
+    });
+    if (error) {
+      setStatus((s) => (s.includes("History") ? s : `${s} (History write failed: ${error.message})`));
+    }
+  }
+
+  async function persistGlobalState(stateToSave: TrackerState, reason: string) {
     if (!isAuthed) {
       router.replace("/login");
       return;
     }
-    setStatus("Saving…");
 
-    const state: TrackerState = { day, useAttrition, rows };
+    const { data: authData } = await supabase.auth.getUser();
+    const userId = authData.user?.id ?? null;
+    const email = authData.user?.email ?? null;
 
-    const { error } = await supabase.from("global_tracker_state").upsert(
-      {
-        id: 1,
-        state,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "id" }
-    );
+    const nowIso = new Date().toISOString();
+
+    const { error } = await supabase
+      .from("global_tracker_state")
+      .upsert(
+        {
+          id: 1,
+          state: stateToSave,
+          updated_at: nowIso,
+          updated_by_user_id: userId,
+          updated_by_email: email,
+        },
+        { onConflict: "id" }
+      );
 
     if (error) {
-      setStatus(`Save failed: ${error.message}`);
+      setStatus(`${reason} failed: ${error.message}`);
       return;
     }
-    setStatus("Saved (global).");
+
+    setLastUpdatedAt(nowIso);
+    setLastUpdatedBy(email);
+    setStatus(`${reason}.`);
+
+    await loadHistory();
   }
 
-  // Optional: autosave (debounced)
+  async function saveNow() {
+    setStatus("Saving…");
+    const stateToSave: TrackerState = { day, useAttrition, rows };
+
+    await persistGlobalState(stateToSave, "Saved (global)");
+
+    const { data: authData } = await supabase.auth.getUser();
+    const userId = authData.user?.id ?? null;
+    const email = authData.user?.email ?? null;
+
+    await writeHistorySnapshot(stateToSave, email, userId);
+    lastHistoryWriteAtRef.current = Date.now();
+    await loadHistory();
+  }
+
   const saveTimer = useRef<number | null>(null);
   useEffect(() => {
     if (!isAuthed) return;
+
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
 
-    saveTimer.current = window.setTimeout(() => {
-      supabase
+    saveTimer.current = window.setTimeout(async () => {
+      const stateToSave: TrackerState = { day, useAttrition, rows };
+      const { data: authData } = await supabase.auth.getUser();
+      const userId = authData.user?.id ?? null;
+      const email = authData.user?.email ?? null;
+
+      const nowIso = new Date().toISOString();
+
+      const { error } = await supabase
         .from("global_tracker_state")
         .upsert(
-          { id: 1, state: { day, useAttrition, rows }, updated_at: new Date().toISOString() },
+          {
+            id: 1,
+            state: stateToSave,
+            updated_at: nowIso,
+            updated_by_user_id: userId,
+            updated_by_email: email,
+          },
           { onConflict: "id" }
-        )
-        .then(({ error }) => {
-          if (error) setStatus(`Autosave failed: ${error.message}`);
-          else setStatus("Autosaved (global).");
-        });
+        );
+
+      if (error) {
+        setStatus(`Autosave failed: ${error.message}`);
+        return;
+      }
+
+      setLastUpdatedAt(nowIso);
+      setLastUpdatedBy(email);
+      setStatus("Autosaved (global).");
+
+      const nowMs = Date.now();
+      if (nowMs - lastHistoryWriteAtRef.current >= 60_000) {
+        await writeHistorySnapshot(stateToSave, email, userId);
+        lastHistoryWriteAtRef.current = nowMs;
+        await loadHistory();
+      }
     }, 800);
 
     return () => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
     };
-  }, [isAuthed, day, useAttrition, rows, supabase]);
+  }, [isAuthed, day, useAttrition, rows, supabase, router]);
 
-  // ---- EXPORT excel ----
+  async function restoreFromHistory(h: HistoryRow) {
+    try {
+      const restored = normalizeLoadedState(safeParseState(h.state));
+
+      setDay(restored.day);
+      setUseAttrition(restored.useAttrition);
+      setRows(restored.rows);
+
+      setStatus(`Restoring snapshot #${h.id}…`);
+      await persistGlobalState(restored, `Restored snapshot #${h.id}`);
+
+      const { data: authData } = await supabase.auth.getUser();
+      const userId = authData.user?.id ?? null;
+      const email = authData.user?.email ?? null;
+
+      await writeHistorySnapshot(restored, email, userId);
+      lastHistoryWriteAtRef.current = Date.now();
+      await loadHistory();
+    } catch (e: any) {
+      setStatus(`Restore failed: ${e?.message ?? "Unknown error"}`);
+    }
+  }
+
   function exportExcel() {
     const header = [
       "BN",
@@ -295,7 +513,6 @@ export default function Home() {
       "Destroyed D4",
       "Destroyed D5",
     ];
-
     const data = rows.map((r) => {
       const d = normalizeDestroyedByDay(r.destroyedByDay);
       return {
@@ -309,16 +526,13 @@ export default function Home() {
         "Destroyed D5": d[4] || 0,
       };
     });
-
     const ws = XLSX.utils.json_to_sheet(data, { header });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "BDA");
-
     const name = `bda_tracker_day${day}_${new Date().toISOString().slice(0, 10)}.xlsx`;
     XLSX.writeFile(wb, name);
   }
 
-  // ---- import excel ----
   async function importExcel(file: File, mode: "replace" | "append") {
     if (!file.name.toLowerCase().endsWith(".xlsx")) {
       alert("Upload a .xlsx Excel file only.");
@@ -355,6 +569,7 @@ export default function Home() {
 
         const dailySum = d1 + d2 + d3 + d4 + d5;
         const destroyedByDay = dailySum > 0 ? [d1, d2, d3, d4, d5] : [destroyedLegacy, 0, 0, 0, 0];
+
         const byDay = normalizeDestroyedByDay(destroyedByDay);
 
         return {
@@ -385,9 +600,36 @@ export default function Home() {
 
   return (
     <main style={{ padding: 20, maxWidth: 1200 }}>
+      {/* Header */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        <h1 style={{ margin: 0 }}>BDA Tracker</h1>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+        <div style={{ display: "grid", gap: 4 }}>
+          <h1 style={{ margin: 0 }}>BDA Tracker</h1>
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            Last updated: <strong>{formatLastUpdated(lastUpdatedAt)}</strong>
+            {lastUpdatedBy ? (
+              <>
+                {" "}
+                by <strong>{lastUpdatedBy}</strong>
+              </>
+            ) : null}
+          </div>
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 13, opacity: 0.85, display: "flex", gap: 8, alignItems: "center" }}>
+            Search
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Filter unit or equipment…"
+              style={{ padding: "6px 8px", minWidth: 240 }}
+            />
+          </label>
+
+          <button onClick={() => setSortMode((m) => cycleSort(m))}>Sort: {sortLabel(sortMode)}</button>
+
+          <button onClick={() => setShowHistory((v) => !v)}>{showHistory ? "Hide History" : "History / Rollback"}</button>
+
           <div style={{ fontFamily: "monospace", opacity: 0.8 }}>{status}</div>
 
           <button onClick={saveNow} disabled={!isAuthed}>
@@ -399,6 +641,64 @@ export default function Home() {
           </button>
         </div>
       </div>
+
+      {/* History panel */}
+      {showHistory ? (
+        <div style={{ border: "1px solid #444", padding: 12, marginTop: 12, marginBottom: 18, background: "#111" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 700 }}>History (last 25)</div>
+            <button onClick={loadHistory} disabled={historyBusy}>
+              {historyBusy ? "Refreshing…" : "Refresh"}
+            </button>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>
+              Autosave snapshots are throttled (max ~1/min). Manual Save and Restore always snapshot.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10, overflowX: "auto" }}>
+            <table border={1} cellPadding={6} style={{ width: "100%" }}>
+              <thead>
+                <tr>
+                  <th style={{ width: 90 }}>ID</th>
+                  <th style={{ width: 220 }}>Saved At</th>
+                  <th>By</th>
+                  <th style={{ width: 120 }}>Day</th>
+                  <th style={{ width: 160 }}>Rows</th>
+                  <th style={{ width: 160 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((h) => {
+                  const st = safeParseState(h.state);
+                  const d = clampInt((st as any).day ?? 1, 1, 5);
+                  const rcount = Array.isArray((st as any).rows) ? (st as any).rows.length : 0;
+
+                  return (
+                    <tr key={h.id}>
+                      <td>{h.id}</td>
+                      <td>{formatLastUpdated(h.saved_at)}</td>
+                      <td>{h.saved_by_email ?? "—"}</td>
+                      <td>Day {d}</td>
+                      <td>{rcount}</td>
+                      <td>
+                        <button onClick={() => restoreFromHistory(h)}>Restore</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+
+                {history.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} style={{ opacity: 0.8, textAlign: "center" }}>
+                      No history yet. Click Save to create the first snapshot.
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
 
       {/* Upload */}
       <h2>Upload Excel (.xlsx)</h2>
@@ -425,7 +725,6 @@ export default function Home() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <div>Drag & drop .xlsx here</div>
-
           <label style={{ marginLeft: "auto" }}>
             <input
               type="file"
@@ -468,21 +767,20 @@ export default function Home() {
           <input type="range" min={1} max={5} value={day} onChange={(e) => setDayAndRecalc(e.target.value)} />
           <div style={{ width: 70, textAlign: "right" }}>Day {day}</div>
         </div>
-
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <input type="checkbox" checked={useAttrition} onChange={(e) => setUseAttrition(e.target.checked)} />
           Apply attrition over time
         </label>
       </div>
 
-      {/* BCG Total Bar */}
-      <h2>BCG Total Combat Power</h2>
+      {/* 165 BCG Total Bar (filtered) */}
+      <h2>165 BCG Total Combat Power</h2>
       <div style={{ marginBottom: 18 }}>
-        {computedRows.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No BDA data yet.</div>
+        {bcgComputedRows.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No 165/OS data yet (for current search filter).</div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
-            <div style={{ fontWeight: 700 }}>BCG</div>
+            <div style={{ fontWeight: 700 }}>165 BCG</div>
             <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
               <div style={{ width: `${bcgRemPct}%`, background: "#1f8f3a" }} />
               <div style={{ width: `${bcgDesPct}%`, background: "#b3261e" }} />
@@ -494,17 +792,50 @@ export default function Home() {
         )}
       </div>
 
-      {/* BN Combat Power */}
-      <h2>BN Combat Power</h2>
+      {/* BN Combat Power (all units, as before) */}
+      <h2>Unit Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
-        {bnSummaries.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No BN data yet.</div>
+        {sortedBnSummaries.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No unit data (for current search filter).</div>
         ) : (
           <div style={{ display: "grid", gap: 10 }}>
-            {bnSummaries.map((bn) => {
+            {sortedBnSummaries.map((bn) => {
               const total = bn.onHand || 0;
               const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
+
+              return (
+                <div
+                  key={bn.bn}
+                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
+                >
+                  <div style={{ fontWeight: 600 }}>{bn.bn}</div>
+                  <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
+                    <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
+                    <div style={{ width: `${desPct}%`, background: "#b3261e" }} />
+                  </div>
+                  <div style={{ fontFamily: "monospace" }}>
+                    CP {bn.combatPowerPct.toFixed(1)}% | Rem {bn.remaining} | Des {bn.destroyed}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Other units combat power (bars by unit, non-165/non-OS only) */}
+      <h2>Other Unit Combat Power</h2>
+      <div style={{ marginBottom: 10 }}>
+        {sortedOtherUnitSummaries.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No “other” units (for current search filter).</div>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {sortedOtherUnitSummaries.map((bn) => {
+              const total = bn.onHand || 0;
+              const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
+              const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
+
               return (
                 <div
                   key={bn.bn}
@@ -533,10 +864,14 @@ export default function Home() {
 
       {/* Input Rows */}
       <h2>Input Rows</h2>
+      <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+        Showing {filteredInputRows.length} of {rows.length} rows
+      </div>
+
       <table border={1} cellPadding={6} style={{ width: "100%", marginBottom: 18 }}>
         <thead>
           <tr>
-            <th style={{ width: 90 }}>BN</th>
+            <th style={{ width: 90 }}>UNIT</th>
             <th>Equipment Type</th>
             <th style={{ width: 90 }}>On Hand</th>
             <th style={{ width: 90 }}>D1</th>
@@ -550,10 +885,11 @@ export default function Home() {
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => {
+          {filteredInputRows.map((r) => {
             const d = normalizeDestroyedByDay(r.destroyedByDay);
             const totalDestroyed = d.reduce((s, v) => s + v, 0);
             const inferred = inferDailyAttritionPct(r.onHand, d, day);
+
             return (
               <tr key={r.id}>
                 <td>
@@ -595,10 +931,10 @@ export default function Home() {
             );
           })}
 
-          {rows.length === 0 ? (
+          {filteredInputRows.length === 0 ? (
             <tr>
               <td colSpan={11} style={{ textAlign: "center", opacity: 0.8 }}>
-                No rows. Click “Add Row”.
+                No rows match your search. Clear the search box or click “Add Row”.
               </td>
             </tr>
           ) : null}
@@ -606,11 +942,11 @@ export default function Home() {
       </table>
 
       {/* BN Summary */}
-      <h2>BN Summary</h2>
+      <h2>Unit Summary</h2>
       <table border={1} cellPadding={6} style={{ width: 860, marginBottom: 18 }}>
         <thead>
           <tr>
-            <th>BN</th>
+            <th>UNIT</th>
             <th>On Hand</th>
             <th>Remaining</th>
             <th>Destroyed</th>
@@ -619,7 +955,7 @@ export default function Home() {
           </tr>
         </thead>
         <tbody>
-          {bnSummaries.map((bn) => (
+          {sortedBnSummaries.map((bn) => (
             <tr key={bn.bn}>
               <td>{bn.bn}</td>
               <td>{bn.onHand}</td>
@@ -629,10 +965,11 @@ export default function Home() {
               <td>{bn.daysTo25Pct ?? "N/A"}</td>
             </tr>
           ))}
-          {bnSummaries.length === 0 ? (
+
+          {sortedBnSummaries.length === 0 ? (
             <tr>
               <td colSpan={6} style={{ textAlign: "center", opacity: 0.8 }}>
-                No BN data yet.
+                No unit data (for current search filter).
               </td>
             </tr>
           ) : null}
@@ -644,7 +981,7 @@ export default function Home() {
       <table border={1} cellPadding={6} style={{ width: "100%" }}>
         <thead>
           <tr>
-            <th>BN</th>
+            <th>UNIT</th>
             <th>Equipment</th>
             <th>On Hand</th>
             <th>Manual (Active)</th>
@@ -671,10 +1008,11 @@ export default function Home() {
               <td>{r.daysTo25Pct ?? "N/A"}</td>
             </tr>
           ))}
+
           {computedRows.length === 0 ? (
             <tr>
               <td colSpan={10} style={{ textAlign: "center", opacity: 0.8 }}>
-                No computed rows yet.
+                No computed rows (for current search filter).
               </td>
             </tr>
           ) : null}
