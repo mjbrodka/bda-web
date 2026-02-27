@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import * as XLSX from "xlsx";
 
 import { createClient } from "@/app/lib/supabase/client";
@@ -105,6 +106,7 @@ const DEFAULT_STATE: TrackerState = {
 };
 
 export default function Home() {
+  const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
 
   const [day, setDay] = useState<number>(DEFAULT_STATE.day);
@@ -126,7 +128,7 @@ export default function Home() {
       setIsAuthed(authed);
 
       if (!authed) {
-        setStatus("Not logged in. Go to /login.");
+        router.replace("/login");
         return;
       }
 
@@ -234,7 +236,7 @@ export default function Home() {
   // ---- SAVE ----
   async function saveNow() {
     if (!isAuthed) {
-      alert("Not logged in.");
+      router.replace("/login");
       return;
     }
     setStatus("Saving…");
