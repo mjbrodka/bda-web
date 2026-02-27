@@ -68,22 +68,46 @@ function newRow(day: number): TrackerRow {
   };
 }
 
-// ---- 165 group membership: explicit allowlist + OS/SS included ----
-function normalizeBn(raw: unknown) {
-  const s = String(raw ?? "")
-    .trim()
-    .toUpperCase()
-    .replace(/\s+/g, " ");
+/**
+ * Canonicalize BN labels so grouping works:
+ * - "1651 AR" -> "1651"
+ * - "1654 IN" -> "1654"
+ * - "OS/SS BN", "OSSS", "OS-SS" -> "OS/SS"
+ * - "OS XYZ" stays "OS XYZ" (but will still count as 165 group because it starts with OS)
+ */
+function canonicalBn(raw: unknown) {
+  let s = String(raw ?? "").trim().toUpperCase().replace(/\s+/g, " ");
+  if (!s) return "";
 
-  // Normalize common variants to OS/SS
-  if (s === "OSSS" || s === "OS-SS" || s === "OS & SS" || s === "OS AND SS") return "OS/SS";
+  // Normalize OS/SS variants first
+  const sNoSpace = s.replace(/\s+/g, "");
+  if (
+    sNoSpace === "OS/SS" ||
+    sNoSpace === "OS/SSBN" ||
+    sNoSpace === "OSSS" ||
+    sNoSpace === "OSSSBN" ||
+    sNoSpace === "OS-SS" ||
+    sNoSpace === "OS-SSBN" ||
+    sNoSpace === "OS&SS" ||
+    sNoSpace === "OSANDSS" ||
+    sNoSpace === "OSANDSSBN"
+  ) {
+    return "OS/SS";
+  }
+  // Also catch strings like "OS/SS BN" or "OS-SS BN" etc.
+  if (/^OS\s*[-/&]?\s*SS(\s*BN)?$/i.test(s)) return "OS/SS";
+
+  // If it starts with digits, keep the leading numeric token only: "1651 AR" -> "1651"
+  const m = s.match(/^(\d{3,6})\b/);
+  if (m) return m[1];
+
   return s;
 }
 
-const BCG_165_BNS = new Set(["1651", "1652", "1653", "1654", "1657", "1658", "1659", "OS/SS"]);
-
-function is165BcgUnit(bn: any) {
-  return BCG_165_BNS.has(normalizeBn(bn));
+// ---- 165 group membership: prefix rule (165* or OS*) ----
+function is165BcgUnit(bn: unknown) {
+  const c = canonicalBn(bn);
+  return c.startsWith("165") || c.startsWith("OS");
 }
 
 type TrackerState = {
@@ -332,10 +356,22 @@ export default function Home() {
     });
   }, [rows, query]);
 
+  /**
+   * IMPORTANT FIX:
+   * Canonicalize BN *before* computeRows so summaries group correctly.
+   * This is what fixes "1651 AR" showing under Other Units.
+   */
+  const filteredComputedInputRows = useMemo(() => {
+    return filteredInputRows.map((r) => ({
+      ...r,
+      bn: canonicalBn(r.bn),
+    }));
+  }, [filteredInputRows]);
+
   // ---- compute (based on filtered rows so search affects summaries/bars/computed) ----
   const { bnSummaries, computedRows } = useMemo(
-    () => computeRows(filteredInputRows, { day, useAttrition, manualWins: true }),
-    [filteredInputRows, day, useAttrition]
+    () => computeRows(filteredComputedInputRows, { day, useAttrition, manualWins: true }),
+    [filteredComputedInputRows, day, useAttrition]
   );
 
   // ---- 165 totals for top bar (computed rows) ----
@@ -560,14 +596,21 @@ export default function Home() {
     const parsed: TrackerRow[] = json
       .map((r) => {
         const bn = String(getCell(r, ["BN", "Bn", "bn", "Battalion", "Unit"]) ?? "").trim();
-        const equipmentType = String(getCell(r, ["Equipment Type", "Equipment", "equipment type", "equipment"]) ?? "").trim();
+        const equipmentType = String(
+          getCell(r, ["Equipment Type", "Equipment", "equipment type", "equipment"]) ?? ""
+        ).trim();
         const onHand = Number(getCell(r, ["On Hand", "OnHand", "on hand"]) ?? 0) || 0;
 
-        const d1 = Number(getCell(r, ["Destroyed D1", "Destroyed Day 1", "D1", "Day 1 Destroyed", "Destroyed 1"]) ?? 0) || 0;
-        const d2 = Number(getCell(r, ["Destroyed D2", "Destroyed Day 2", "D2", "Day 2 Destroyed", "Destroyed 2"]) ?? 0) || 0;
-        const d3 = Number(getCell(r, ["Destroyed D3", "Destroyed Day 3", "D3", "Day 3 Destroyed", "Destroyed 3"]) ?? 0) || 0;
-        const d4 = Number(getCell(r, ["Destroyed D4", "Destroyed Day 4", "D4", "Day 4 Destroyed", "Destroyed 4"]) ?? 0) || 0;
-        const d5 = Number(getCell(r, ["Destroyed D5", "Destroyed Day 5", "D5", "Day 5 Destroyed", "Destroyed 5"]) ?? 0) || 0;
+        const d1 =
+          Number(getCell(r, ["Destroyed D1", "Destroyed Day 1", "D1", "Day 1 Destroyed", "Destroyed 1"]) ?? 0) || 0;
+        const d2 =
+          Number(getCell(r, ["Destroyed D2", "Destroyed Day 2", "D2", "Day 2 Destroyed", "Destroyed 2"]) ?? 0) || 0;
+        const d3 =
+          Number(getCell(r, ["Destroyed D3", "Destroyed Day 3", "D3", "Day 3 Destroyed", "Destroyed 3"]) ?? 0) || 0;
+        const d4 =
+          Number(getCell(r, ["Destroyed D4", "Destroyed Day 4", "D4", "Day 4 Destroyed", "Destroyed 4"]) ?? 0) || 0;
+        const d5 =
+          Number(getCell(r, ["Destroyed D5", "Destroyed Day 5", "D5", "Day 5 Destroyed", "Destroyed 5"]) ?? 0) || 0;
 
         const destroyedLegacy = Number(getCell(r, ["Destroyed", "destroyed"]) ?? 0) || 0;
 
@@ -579,7 +622,7 @@ export default function Home() {
 
         return {
           id: crypto.randomUUID(),
-          bn,
+          bn, // keep raw, canonicalization happens in compute stage
           equipmentType,
           onHand,
           destroyedByDay: byDay,
@@ -778,7 +821,7 @@ export default function Home() {
         </label>
       </div>
 
-      {/* 165 BCG Total Bar (computed, filtered by search) */}
+      {/* 165 BCG Total Bar */}
       <h2>165 BCG Total Combat Power</h2>
       <div style={{ marginBottom: 18 }}>
         {bcgComputedRows.length === 0 ? (
@@ -797,7 +840,7 @@ export default function Home() {
         )}
       </div>
 
-      {/* 165 BNs Combat Power (ONLY allowlist + OS/SS) */}
+      {/* 165 BNs Combat Power */}
       <h2>165 BNs Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedBcgUnitSummaries.length === 0 ? (
@@ -810,10 +853,7 @@ export default function Home() {
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
 
               return (
-                <div
-                  key={bn.bn}
-                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
-                >
+                <div key={bn.bn} style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
                   <div style={{ fontWeight: 600 }}>{bn.bn}</div>
                   <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
                     <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
@@ -829,7 +869,7 @@ export default function Home() {
         )}
       </div>
 
-      {/* Other units combat power (EXCLUDES 165 allowlist + OS/SS) */}
+      {/* Other units combat power */}
       <h2>Other Unit Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedOtherUnitSummaries.length === 0 ? (
@@ -842,10 +882,7 @@ export default function Home() {
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
 
               return (
-                <div
-                  key={bn.bn}
-                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
-                >
+                <div key={bn.bn} style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
                   <div style={{ fontWeight: 600 }}>{bn.bn}</div>
                   <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
                     <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />

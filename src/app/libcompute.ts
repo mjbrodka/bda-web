@@ -44,42 +44,50 @@ export type GroupSummary = {
   daysTo25Pct: number | null
 }
 
-const BCG_165_BNS = new Set([
-  "1651",
-  "1652",
-  "1653",
-  "1654",
-  "1657",
-  "1658",
-  "1659",
-])
-
-// OS/SS must be under 165 per your requirement
-const OS_SS_ALIASES = new Set([
-  "OS/SS",
-  "OSSS",
-  "OS-SS",
-  "OS & SS",
-  "OS AND SS",
-])
-
+/**
+ * Canonicalize BN labels so grouping works:
+ * - "1651 AR" -> "1651"
+ * - "1654 IN" -> "1654"
+ * - "OS/SS BN", "OSSS", "OS-SS" -> "OS/SS"
+ * - Any unit starting with "OS" stays "OS..." (but counts toward 165 group)
+ */
 function normalizeBn(raw: unknown) {
-  // normalize spaces, case, and common variants so matching is stable
-  const s = String(raw ?? "")
-    .trim()
-    .toUpperCase()
-    .replace(/\s+/g, " ")
+  let s = String(raw ?? "").trim().toUpperCase().replace(/\s+/g, " ")
+  if (!s) return ""
 
-  // normalize common OS/SS variants to a single canonical token
-  if (OS_SS_ALIASES.has(s)) return "OS/SS"
+  // Normalize OS/SS variants first
+  const sNoSpace = s.replace(/\s+/g, "")
+  if (
+    sNoSpace === "OS/SS" ||
+    sNoSpace === "OS/SSBN" ||
+    sNoSpace === "OSSS" ||
+    sNoSpace === "OSSSBN" ||
+    sNoSpace === "OS-SS" ||
+    sNoSpace === "OS-SSBN" ||
+    sNoSpace === "OS&SS" ||
+    sNoSpace === "OSANDSS" ||
+    sNoSpace === "OSANDSSBN"
+  ) {
+    return "OS/SS"
+  }
+  if (/^OS\s*[-/&]?\s*SS(\s*BN)?$/i.test(s)) return "OS/SS"
+
+  // If it starts with digits, keep the leading numeric token only: "1651 AR" -> "1651"
+  const m = s.match(/^(\d{3,6})\b/)
+  if (m) return m[1]
 
   return s
 }
 
+/**
+ * 165 group membership: prefix rule
+ * - Any canonical BN starting with "165" OR "OS" is 165_BCG
+ * - Everything else is OTHER
+ */
 function groupForBn(rawBn: unknown): GroupKey {
   const bn = normalizeBn(rawBn)
-  if (bn === "OS/SS") return "165_BCG"
-  if (BCG_165_BNS.has(bn)) return "165_BCG"
+  if (!bn) return "OTHER"
+  if (bn.startsWith("165") || bn.startsWith("OS")) return "165_BCG"
   return "OTHER"
 }
 
@@ -176,9 +184,9 @@ export function computeRows(
 
     return {
       ...row,
-      bn: normalizeBn(row.bn), // important: canonicalize BN here
+      bn: normalizeBn(row.bn), // critical: make BN stable everywhere
       onHand,
-      destroyedManual: manual, // keep this field meaningful for downstream display/compat
+      destroyedManual: manual,
       destroyedAttrition,
       destroyed,
       remaining,
