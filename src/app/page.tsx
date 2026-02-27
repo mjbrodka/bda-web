@@ -212,6 +212,26 @@ type HistoryRow = {
   saved_by_email: string | null;
 };
 
+function badgeStyle(bg: string, fg: string): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "4px 10px",
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 700,
+    background: bg,
+    color: fg,
+    border: "1px solid rgba(255,255,255,0.18)",
+    userSelect: "none",
+  };
+}
+
+function normalizeEmail(email: string | null | undefined) {
+  return String(email ?? "").trim().toLowerCase();
+}
+
 export default function Home() {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
@@ -223,6 +243,11 @@ export default function Home() {
   const [isDragging, setIsDragging] = useState(false);
   const [isAuthed, setIsAuthed] = useState<boolean>(false);
   const [status, setStatus] = useState<string>("");
+
+  // Editor gating (source of truth: public.tracker_editor_emails)
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [isEditor, setIsEditor] = useState<boolean>(false);
+  const [editorChecked, setEditorChecked] = useState<boolean>(false);
 
   // Search + sort + last-updated display
   const [query, setQuery] = useState<string>("");
@@ -238,6 +263,31 @@ export default function Home() {
 
   // Throttle history snapshots (autosave can be frequent)
   const lastHistoryWriteAtRef = useRef<number>(0);
+
+  const readOnly = editorChecked ? !isEditor : true;
+
+  async function checkIsEditor(email: string | null) {
+    const e = normalizeEmail(email);
+    if (!e) return false;
+
+    // Preferred: ask the allowlist table directly.
+    // NOTE: This requires tracker_editor_emails to be readable to authenticated users,
+    // or you can loosen with a policy: SELECT to authenticated using (true).
+    const { data, error } = await supabase
+      .from("tracker_editor_emails")
+      .select("email")
+      .ilike("email", e)
+      .limit(1);
+
+    if (error) {
+      // If the editor table is not readable due to RLS, don't spam viewers;
+      // fail closed (viewer) and show one status for debugging.
+      setStatus(`Editor check failed (defaulting to viewer): ${error.message}`);
+      return false;
+    }
+
+    return (data ?? []).length > 0;
+  }
 
   async function loadHistory() {
     if (!isAuthed) return;
@@ -269,10 +319,18 @@ export default function Home() {
       const authed = !!authData?.user && !authErr;
       setIsAuthed(authed);
 
+      const email = authData?.user?.email ?? null;
+      setUserEmail(email);
+
       if (!authed) {
         router.replace("/login");
         return;
       }
+
+      // Determine editor status (fail closed to viewer)
+      const editor = await checkIsEditor(email);
+      setIsEditor(editor);
+      setEditorChecked(true);
 
       const { data, error } = await supabase
         .from("global_tracker_state")
@@ -299,7 +357,7 @@ export default function Home() {
       setUseAttrition(st.useAttrition);
       setRows(st.rows);
 
-      setStatus("Loaded global tracker.");
+      setStatus(editor ? "Loaded global tracker (editor)." : "Loaded global tracker (viewer).");
       await loadHistory();
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -465,6 +523,8 @@ export default function Home() {
   }
 
   async function saveNow() {
+    if (readOnly) return;
+
     setStatus("Saving…");
     const stateToSave: TrackerState = { day, useAttrition, rows };
 
@@ -479,9 +539,11 @@ export default function Home() {
     await loadHistory();
   }
 
+  // ---- AUTOSAVE (editors only; never run for viewers) ----
   const saveTimer = useRef<number | null>(null);
   useEffect(() => {
     if (!isAuthed) return;
+    if (readOnly) return; // ✅ viewers never autosave
 
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
 
@@ -526,9 +588,11 @@ export default function Home() {
     return () => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
     };
-  }, [isAuthed, day, useAttrition, rows, supabase, router]);
+  }, [isAuthed, readOnly, day, useAttrition, rows, supabase, router]);
 
   async function restoreFromHistory(h: HistoryRow) {
+    if (readOnly) return;
+
     try {
       const restored = normalizeLoadedState(safeParseState(h.state));
 
@@ -583,6 +647,8 @@ export default function Home() {
   }
 
   async function importExcel(file: File, mode: "replace" | "append") {
+    if (readOnly) return;
+
     if (!file.name.toLowerCase().endsWith(".xlsx")) {
       alert("Upload a .xlsx Excel file only.");
       return;
@@ -650,17 +716,50 @@ export default function Home() {
     <main style={{ padding: 20, maxWidth: 1200 }}>
       {/* Header */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        <div style={{ display: "grid", gap: 4 }}>
+        <div style={{ display: "grid", gap: 6 }}>
           <h1 style={{ margin: 0 }}>BDA Tracker</h1>
-          <div style={{ fontSize: 13, opacity: 0.85 }}>
-            Last updated: <strong>{formatLastUpdated(lastUpdatedAt)}</strong>
-            {lastUpdatedBy ? (
-              <>
-                {" "}
-                by <strong>{lastUpdatedBy}</strong>
-              </>
+
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              Last updated: <strong>{formatLastUpdated(lastUpdatedAt)}</strong>
+              {lastUpdatedBy ? (
+                <>
+                  {" "}
+                  by <strong>{lastUpdatedBy}</strong>
+                </>
+              ) : null}
+            </div>
+
+            {editorChecked ? (
+              readOnly ? (
+                <span style={badgeStyle("rgba(255, 193, 7, 0.15)", "rgba(255, 193, 7, 0.95)")}>Read-only (viewer)</span>
+              ) : (
+                <span style={badgeStyle("rgba(0, 255, 163, 0.12)", "rgba(0, 255, 163, 0.95)")}>Editor</span>
+              )
+            ) : (
+              <span style={badgeStyle("rgba(160,160,160,0.12)", "rgba(220,220,220,0.95)")}>Checking access…</span>
+            )}
+
+            {userEmail ? (
+              <span style={{ fontSize: 12, opacity: 0.75, fontFamily: "monospace" }}>{userEmail}</span>
             ) : null}
           </div>
+
+          {editorChecked && readOnly ? (
+            <div
+              style={{
+                marginTop: 6,
+                padding: "10px 12px",
+                border: "1px solid rgba(255,255,255,0.18)",
+                borderRadius: 10,
+                background: "rgba(255, 193, 7, 0.08)",
+                fontSize: 13,
+                opacity: 0.95,
+              }}
+            >
+              You have view-only access. Editing, autosave, and uploads are disabled.
+            </div>
+          ) : null}
         </div>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -680,7 +779,7 @@ export default function Home() {
 
           <div style={{ fontFamily: "monospace", opacity: 0.8 }}>{status}</div>
 
-          <button onClick={saveNow} disabled={!isAuthed}>
+          <button onClick={saveNow} disabled={!isAuthed || readOnly}>
             Save
           </button>
 
@@ -701,6 +800,9 @@ export default function Home() {
             <div style={{ fontSize: 12, opacity: 0.8 }}>
               Autosave snapshots are throttled (max ~1/min). Manual Save and Restore always snapshot.
             </div>
+            {editorChecked && readOnly ? (
+              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.85 }}>Restore is disabled in view-only mode.</div>
+            ) : null}
           </div>
 
           <div style={{ marginTop: 10, overflowX: "auto" }}>
@@ -729,7 +831,9 @@ export default function Home() {
                       <td>Day {d}</td>
                       <td>{rcount}</td>
                       <td>
-                        <button onClick={() => restoreFromHistory(h)}>Restore</button>
+                        <button onClick={() => restoreFromHistory(h)} disabled={readOnly}>
+                          Restore
+                        </button>
                       </td>
                     </tr>
                   );
@@ -753,22 +857,31 @@ export default function Home() {
       <div
         onDragEnter={(e) => {
           e.preventDefault();
-          setIsDragging(true);
+          if (!readOnly) setIsDragging(true);
         }}
         onDragOver={(e) => {
           e.preventDefault();
-          setIsDragging(true);
+          if (!readOnly) setIsDragging(true);
         }}
         onDragLeave={(e) => {
           e.preventDefault();
-          setIsDragging(false);
+          if (!readOnly) setIsDragging(false);
         }}
-        onDrop={onDrop}
+        onDrop={(e) => {
+          if (readOnly) {
+            e.preventDefault();
+            setIsDragging(false);
+            return;
+          }
+          onDrop(e);
+        }}
         style={{
           border: "2px dashed #666",
           padding: 20,
           marginBottom: 20,
           background: isDragging ? "#222" : "transparent",
+          opacity: readOnly ? 0.55 : 1,
+          pointerEvents: readOnly ? "none" : "auto",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
@@ -778,17 +891,29 @@ export default function Home() {
               type="file"
               accept=".xlsx"
               style={{ display: "none" }}
+              disabled={readOnly}
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (file) importExcel(file, "replace");
                 e.currentTarget.value = "";
               }}
             />
-            <span style={{ padding: "6px 10px", border: "1px solid #666", cursor: "pointer" }}>Browse…</span>
+            <span
+              style={{
+                padding: "6px 10px",
+                border: "1px solid #666",
+                cursor: readOnly ? "not-allowed" : "pointer",
+                opacity: readOnly ? 0.6 : 1,
+              }}
+            >
+              Browse…
+            </span>
           </label>
 
           <button
+            disabled={readOnly}
             onClick={() => {
+              if (readOnly) return;
               const input = document.createElement("input");
               input.type = "file";
               input.accept = ".xlsx";
@@ -812,11 +937,23 @@ export default function Home() {
       <div style={{ display: "flex", gap: 20, marginBottom: 20, flexWrap: "wrap" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <div style={{ width: 60 }}>Day</div>
-          <input type="range" min={1} max={5} value={day} onChange={(e) => setDayAndRecalc(e.target.value)} />
+          <input
+            type="range"
+            min={1}
+            max={5}
+            value={day}
+            onChange={(e) => setDayAndRecalc(e.target.value)}
+            disabled={readOnly}
+          />
           <div style={{ width: 70, textAlign: "right" }}>Day {day}</div>
         </div>
-        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input type="checkbox" checked={useAttrition} onChange={(e) => setUseAttrition(e.target.checked)} />
+        <label style={{ display: "flex", gap: 8, alignItems: "center", opacity: readOnly ? 0.65 : 1 }}>
+          <input
+            type="checkbox"
+            checked={useAttrition}
+            onChange={(e) => setUseAttrition(e.target.checked)}
+            disabled={readOnly}
+          />
           Apply attrition over time
         </label>
       </div>
@@ -853,7 +990,10 @@ export default function Home() {
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
 
               return (
-                <div key={bn.bn} style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
+                <div
+                  key={bn.bn}
+                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
+                >
                   <div style={{ fontWeight: 600 }}>{bn.bn}</div>
                   <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
                     <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
@@ -882,7 +1022,10 @@ export default function Home() {
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
 
               return (
-                <div key={bn.bn} style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
+                <div
+                  key={bn.bn}
+                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
+                >
                   <div style={{ fontWeight: 600 }}>{bn.bn}</div>
                   <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
                     <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
@@ -900,8 +1043,12 @@ export default function Home() {
 
       {/* Row actions */}
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginBottom: 12 }}>
-        <button onClick={() => setRows((p) => [...p, newRow(day)])}>+ Add Row</button>
-        <button onClick={() => setRows([])}>Clear</button>
+        <button disabled={readOnly} onClick={() => setRows((p) => [...p, newRow(day)])}>
+          + Add Row
+        </button>
+        <button disabled={readOnly} onClick={() => setRows([])}>
+          Clear
+        </button>
       </div>
 
       {/* Input Rows */}
@@ -935,13 +1082,19 @@ export default function Home() {
             return (
               <tr key={r.id}>
                 <td>
-                  <input value={r.bn} onChange={(e) => updateRow(r.id, { bn: e.target.value })} style={{ width: "100%" }} />
+                  <input
+                    value={r.bn}
+                    onChange={(e) => updateRow(r.id, { bn: e.target.value })}
+                    style={{ width: "100%" }}
+                    disabled={readOnly}
+                  />
                 </td>
                 <td>
                   <input
                     value={r.equipmentType}
                     onChange={(e) => updateRow(r.id, { equipmentType: e.target.value })}
                     style={{ width: "100%" }}
+                    disabled={readOnly}
                   />
                 </td>
                 <td>
@@ -951,6 +1104,7 @@ export default function Home() {
                     value={r.onHand}
                     onChange={(e) => updateRow(r.id, { onHand: Number(e.target.value) })}
                     style={{ width: "100%" }}
+                    disabled={readOnly}
                   />
                 </td>
                 {[0, 1, 2, 3, 4].map((idx) => (
@@ -961,13 +1115,16 @@ export default function Home() {
                       value={d[idx] ?? 0}
                       onChange={(e) => updateDestroyedByDay(r.id, idx, Number(e.target.value))}
                       style={{ width: "100%" }}
+                      disabled={readOnly}
                     />
                   </td>
                 ))}
                 <td style={{ fontFamily: "monospace", textAlign: "right" }}>{totalDestroyed}</td>
                 <td style={{ fontFamily: "monospace", textAlign: "right" }}>{inferred.toFixed(2)}%</td>
                 <td>
-                  <button onClick={() => deleteRow(r.id)}>Delete</button>
+                  <button disabled={readOnly} onClick={() => deleteRow(r.id)}>
+                    Delete
+                  </button>
                 </td>
               </tr>
             );
