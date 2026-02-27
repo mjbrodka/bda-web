@@ -67,9 +67,22 @@ function newRow(day: number): TrackerRow {
   };
 }
 
+// ---- 165 BCG membership: explicit allowlist + OS/SS under 165 ----
+function normalizeBn(raw: unknown) {
+  const s = String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, " ");
+
+  if (s === "OSSS" || s === "OS-SS" || s === "OS & SS" || s === "OS AND SS") return "OS/SS";
+  return s;
+}
+
+const BCG_165_BNS = new Set(["1651", "1652", "1653", "1654", "1657", "1658", "1659", "OS/SS"]);
+
 function is165BcgUnit(bn: any) {
-  const s = String(bn ?? "").trim().toUpperCase();
-  return s.startsWith("165") || s.startsWith("OS");
+  const s = normalizeBn(bn);
+  return BCG_165_BNS.has(s);
 }
 
 type TrackerState = {
@@ -353,18 +366,23 @@ export default function Home() {
     else if (sortMode === "CP_ASC")
       arr.sort(
         (a, b) =>
-          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) ||
+          String(a.bn).localeCompare(String(b.bn))
       );
     else
       arr.sort(
         (a, b) =>
-          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) ||
+          String(a.bn).localeCompare(String(b.bn))
       );
     return arr;
   }
 
   const sortedBnSummaries = useMemo(() => sortSummaries(bnSummaries), [bnSummaries, sortMode]);
-  const sortedOtherUnitSummaries = useMemo(() => sortSummaries(otherUnitSummaries), [otherUnitSummaries, sortMode]);
+  const sortedOtherUnitSummaries = useMemo(
+    () => sortSummaries(otherUnitSummaries),
+    [otherUnitSummaries, sortMode]
+  );
 
   async function writeHistorySnapshot(stateToSave: TrackerState, email: string | null, userId: string | null) {
     const { error } = await supabase.from("global_tracker_state_history").insert({
@@ -824,7 +842,7 @@ export default function Home() {
         )}
       </div>
 
-      {/* Other units combat power (bars by unit, non-165/non-OS only) */}
+      {/* Other units combat power (bars by unit, non-165 + non-OS/SS) */}
       <h2>Other Unit Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedOtherUnitSummaries.length === 0 ? (
