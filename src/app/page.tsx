@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import * as XLSX from "xlsx";
+
 import { createClient } from "@/app/lib/supabase/client";
 import { computeRows, type TrackerRow } from "./libcompute";
 
@@ -31,7 +32,7 @@ function clampInt(n: any, min: number, max: number) {
 
 function normalizeDestroyedByDay(arr?: number[]) {
   const base = Array.isArray(arr) ? arr : [];
-  return [0, 0, 0, 0, 0].map((_, i) => Math.max(0, Math.floor(Number(base[i] || 0))));
+  return [0, 0, 0, 0, 0].map((_, i) => Math.max(0, Math.floor(Number(base[i] ?? 0))));
 }
 
 /**
@@ -67,13 +68,14 @@ function newRow(day: number): TrackerRow {
   };
 }
 
-// ---- 165 BCG membership: explicit allowlist + OS/SS under 165 ----
+// ---- 165 group membership: explicit allowlist + OS/SS included ----
 function normalizeBn(raw: unknown) {
   const s = String(raw ?? "")
     .trim()
     .toUpperCase()
     .replace(/\s+/g, " ");
 
+  // Normalize common variants to OS/SS
   if (s === "OSSS" || s === "OS-SS" || s === "OS & SS" || s === "OS AND SS") return "OS/SS";
   return s;
 }
@@ -81,8 +83,7 @@ function normalizeBn(raw: unknown) {
 const BCG_165_BNS = new Set(["1651", "1652", "1653", "1654", "1657", "1658", "1659", "OS/SS"]);
 
 function is165BcgUnit(bn: any) {
-  const s = normalizeBn(bn);
-  return BCG_165_BNS.has(s);
+  return BCG_165_BNS.has(normalizeBn(bn));
 }
 
 type TrackerState = {
@@ -337,10 +338,8 @@ export default function Home() {
     [filteredInputRows, day, useAttrition]
   );
 
-  // ---- 165 BCG-only totals for the top bar ----
-  const bcgComputedRows = useMemo(() => {
-    return computedRows.filter((r) => is165BcgUnit(r.bn));
-  }, [computedRows]);
+  // ---- 165 totals for top bar (computed rows) ----
+  const bcgComputedRows = useMemo(() => computedRows.filter((r) => is165BcgUnit(r.bn)), [computedRows]);
 
   const bcgTotals = useMemo(() => {
     const onHand = bcgComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
@@ -353,10 +352,9 @@ export default function Home() {
   const bcgRemPct = bcgTotals.onHand > 0 ? (bcgTotals.remaining / bcgTotals.onHand) * 100 : 0;
   const bcgDesPct = bcgTotals.onHand > 0 ? (bcgTotals.destroyed / bcgTotals.onHand) * 100 : 0;
 
-  // ---- Split BN summaries into 165-group and other units (bars by unit) ----
-  const otherUnitSummaries = useMemo(() => {
-    return bnSummaries.filter((bn) => !is165BcgUnit(bn.bn));
-  }, [bnSummaries]);
+  // ---- Split BN summaries into 165 group + other (bars by unit) ----
+  const bcgUnitSummaries = useMemo(() => bnSummaries.filter((bn) => is165BcgUnit(bn.bn)), [bnSummaries]);
+  const otherUnitSummaries = useMemo(() => bnSummaries.filter((bn) => !is165BcgUnit(bn.bn)), [bnSummaries]);
 
   // ---- Sort helpers ----
   function sortSummaries(list: typeof bnSummaries) {
@@ -366,23 +364,20 @@ export default function Home() {
     else if (sortMode === "CP_ASC")
       arr.sort(
         (a, b) =>
-          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) ||
-          String(a.bn).localeCompare(String(b.bn))
+          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
       );
     else
       arr.sort(
         (a, b) =>
-          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) ||
-          String(a.bn).localeCompare(String(b.bn))
+          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
       );
     return arr;
   }
 
+  // Keep the all-units list for the summary tables below
   const sortedBnSummaries = useMemo(() => sortSummaries(bnSummaries), [bnSummaries, sortMode]);
-  const sortedOtherUnitSummaries = useMemo(
-    () => sortSummaries(otherUnitSummaries),
-    [otherUnitSummaries, sortMode]
-  );
+  const sortedBcgUnitSummaries = useMemo(() => sortSummaries(bcgUnitSummaries), [bcgUnitSummaries, sortMode]);
+  const sortedOtherUnitSummaries = useMemo(() => sortSummaries(otherUnitSummaries), [otherUnitSummaries, sortMode]);
 
   async function writeHistorySnapshot(stateToSave: TrackerState, email: string | null, userId: string | null) {
     const { error } = await supabase.from("global_tracker_state_history").insert({
@@ -565,21 +560,14 @@ export default function Home() {
     const parsed: TrackerRow[] = json
       .map((r) => {
         const bn = String(getCell(r, ["BN", "Bn", "bn", "Battalion", "Unit"]) ?? "").trim();
-        const equipmentType = String(
-          getCell(r, ["Equipment Type", "Equipment", "equipment type", "equipment"]) ?? ""
-        ).trim();
+        const equipmentType = String(getCell(r, ["Equipment Type", "Equipment", "equipment type", "equipment"]) ?? "").trim();
         const onHand = Number(getCell(r, ["On Hand", "OnHand", "on hand"]) ?? 0) || 0;
 
-        const d1 =
-          Number(getCell(r, ["Destroyed D1", "Destroyed Day 1", "D1", "Day 1 Destroyed", "Destroyed 1"]) ?? 0) || 0;
-        const d2 =
-          Number(getCell(r, ["Destroyed D2", "Destroyed Day 2", "D2", "Day 2 Destroyed", "Destroyed 2"]) ?? 0) || 0;
-        const d3 =
-          Number(getCell(r, ["Destroyed D3", "Destroyed Day 3", "D3", "Day 3 Destroyed", "Destroyed 3"]) ?? 0) || 0;
-        const d4 =
-          Number(getCell(r, ["Destroyed D4", "Destroyed Day 4", "D4", "Day 4 Destroyed", "Destroyed 4"]) ?? 0) || 0;
-        const d5 =
-          Number(getCell(r, ["Destroyed D5", "Destroyed Day 5", "D5", "Day 5 Destroyed", "Destroyed 5"]) ?? 0) || 0;
+        const d1 = Number(getCell(r, ["Destroyed D1", "Destroyed Day 1", "D1", "Day 1 Destroyed", "Destroyed 1"]) ?? 0) || 0;
+        const d2 = Number(getCell(r, ["Destroyed D2", "Destroyed Day 2", "D2", "Day 2 Destroyed", "Destroyed 2"]) ?? 0) || 0;
+        const d3 = Number(getCell(r, ["Destroyed D3", "Destroyed Day 3", "D3", "Day 3 Destroyed", "Destroyed 3"]) ?? 0) || 0;
+        const d4 = Number(getCell(r, ["Destroyed D4", "Destroyed Day 4", "D4", "Day 4 Destroyed", "Destroyed 4"]) ?? 0) || 0;
+        const d5 = Number(getCell(r, ["Destroyed D5", "Destroyed Day 5", "D5", "Day 5 Destroyed", "Destroyed 5"]) ?? 0) || 0;
 
         const destroyedLegacy = Number(getCell(r, ["Destroyed", "destroyed"]) ?? 0) || 0;
 
@@ -587,7 +575,6 @@ export default function Home() {
 
         const dailySum = d1 + d2 + d3 + d4 + d5;
         const destroyedByDay = dailySum > 0 ? [d1, d2, d3, d4, d5] : [destroyedLegacy, 0, 0, 0, 0];
-
         const byDay = normalizeDestroyedByDay(destroyedByDay);
 
         return {
@@ -791,11 +778,11 @@ export default function Home() {
         </label>
       </div>
 
-      {/* 165 BCG Total Bar (filtered) */}
+      {/* 165 BCG Total Bar (computed, filtered by search) */}
       <h2>165 BCG Total Combat Power</h2>
       <div style={{ marginBottom: 18 }}>
         {bcgComputedRows.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No 165/OS data yet (for current search filter).</div>
+          <div style={{ opacity: 0.8 }}>No 165 BN data yet (for current search filter).</div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
             <div style={{ fontWeight: 700 }}>165 BCG</div>
@@ -810,14 +797,14 @@ export default function Home() {
         )}
       </div>
 
-      {/* BN Combat Power (all units, as before) */}
-      <h2>Unit Combat Power</h2>
+      {/* 165 BNs Combat Power (ONLY allowlist + OS/SS) */}
+      <h2>165 BNs Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
-        {sortedBnSummaries.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No unit data (for current search filter).</div>
+        {sortedBcgUnitSummaries.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No 165 BN data (for current search filter).</div>
         ) : (
           <div style={{ display: "grid", gap: 10 }}>
-            {sortedBnSummaries.map((bn) => {
+            {sortedBcgUnitSummaries.map((bn) => {
               const total = bn.onHand || 0;
               const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
               const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
@@ -842,7 +829,7 @@ export default function Home() {
         )}
       </div>
 
-      {/* Other units combat power (bars by unit, non-165 + non-OS/SS) */}
+      {/* Other units combat power (EXCLUDES 165 allowlist + OS/SS) */}
       <h2>Other Unit Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedOtherUnitSummaries.length === 0 ? (
@@ -959,7 +946,7 @@ export default function Home() {
         </tbody>
       </table>
 
-      {/* BN Summary */}
+      {/* Unit Summary (all units) */}
       <h2>Unit Summary</h2>
       <table border={1} cellPadding={6} style={{ width: 860, marginBottom: 18 }}>
         <thead>
