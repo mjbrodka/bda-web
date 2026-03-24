@@ -64,14 +64,6 @@ function normalizeBn(raw: unknown) {
   s = s.replace(/\\/g, "/")
 
   // 1) Brigade-prefixed OS/SS variants
-  // Examples:
-  //   165 OS/SS
-  //   165 OS/SS BN
-  //   165 OSSS
-  //   165 OS-SS
-  //   165 OS & SS
-  //   165 OS AND SS
-  //   163 OS/SS
   const prefixedOsSsMatch = s.match(
     /^(\d{3})\s*[- ]?\s*(OS\/SS|OSSS|OS-SS|OS\s*&\s*SS|OS\s+AND\s+SS)(?:\s*BN)?$/i
   )
@@ -80,9 +72,7 @@ function normalizeBn(raw: unknown) {
   }
 
   // Catch compact forms with spaces removed:
-  //   165OSSS
-  //   165OS/SSBN
-  //   163OSANDSS
+  // 165OSSS, 165OS/SSBN, 163OSANDSS
   const sNoSpace = s.replace(/\s+/g, "")
   const prefixedCompactMatch = sNoSpace.match(
     /^(\d{3})(OS\/SS|OSSS|OS-SS|OS&SS|OSANDSS)(BN)?$/i
@@ -92,8 +82,6 @@ function normalizeBn(raw: unknown) {
   }
 
   // 2) Bare legacy OS/SS variants
-  // Keep them canonicalized for display consistency,
-  // but do NOT assign them to any brigade group.
   if (
     sNoSpace === "OS/SS" ||
     sNoSpace === "OS/SSBN" ||
@@ -169,10 +157,35 @@ function daysToReachFraction(dailyPct: number, targetFraction: number): number |
 
 function normalizeDestroyedByDay(arr?: number[]) {
   const base = Array.isArray(arr) ? arr : []
-  const out = [0, 0, 0, 0, 0].map((_, i) =>
+  return [0, 0, 0, 0, 0].map((_, i) =>
     clamp(Math.round(safeNum(base[i])), 0, Number.MAX_SAFE_INTEGER)
   )
-  return out
+}
+
+/**
+ * Infer the constant daily attrition rate that would produce the
+ * cumulative destroyed-through-day count under the compound model.
+ *
+ * If onHand = 100 and cumulative destroyed by Day 3 = 27, then:
+ * remainingFraction = 73/100
+ * p = 1 - remainingFraction^(1/3)
+ */
+function inferDailyAttritionPctFromDestroyed(
+  onHand: number,
+  destroyedThroughDay: number,
+  day: number
+) {
+  const start = Math.max(0, Math.floor(safeNum(onHand)))
+  const destroyed = clamp(Math.floor(safeNum(destroyedThroughDay)), 0, start)
+  const d = clamp(Math.floor(safeNum(day)), 1, 5)
+
+  if (start <= 0 || destroyed <= 0) return 0
+  if (destroyed >= start) return 100
+
+  const remainingFraction = (start - destroyed) / start
+  const p = 1 - Math.pow(remainingFraction, 1 / d)
+
+  return clamp(p * 100, 0, 100)
 }
 
 export function computeRows(
@@ -193,7 +206,7 @@ export function computeRows(
     const onHand = Math.max(0, Math.floor(safeNum(row.onHand)))
 
     // Manual destroyed (daily) is applied through selected day:
-    // Day 1 uses D1, Day 5 uses D1..D5
+    // Day 1 uses D1, Day 5 uses D1..D5 cumulatively
     let destroyedManualActive = 0
     let destroyedManualTotal = 0
 
@@ -209,9 +222,16 @@ export function computeRows(
 
     const manual = clamp(destroyedManualActive, 0, onHand)
 
+    // Prefer the stored attrition rate if present.
+    // Otherwise infer it directly from cumulative D1..D5 destroyed data.
+    const effectiveDailyAttritionPct =
+      safeNum(row.dailyAttritionPct) > 0
+        ? safeNum(row.dailyAttritionPct)
+        : inferDailyAttritionPctFromDestroyed(onHand, destroyedManualActive, day)
+
     let destroyedAttrition = 0
     if (useAttrition) {
-      const rem = remainingAfterDays(onHand, row.dailyAttritionPct, day)
+      const rem = remainingAfterDays(onHand, effectiveDailyAttritionPct, day)
       destroyedAttrition = clamp(Math.round(onHand - rem), 0, onHand)
     }
 
@@ -223,12 +243,14 @@ export function computeRows(
 
     const remaining = Math.max(0, onHand - destroyed)
     const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0
-    const daysTo25Pct = onHand > 0 ? daysToReachFraction(row.dailyAttritionPct, 0.25) : null
+    const daysTo25Pct =
+      onHand > 0 ? daysToReachFraction(effectiveDailyAttritionPct, 0.25) : null
 
     return {
       ...row,
       bn: normalizeBn(row.bn),
       onHand,
+      dailyAttritionPct: effectiveDailyAttritionPct,
       destroyedManual: manual,
       destroyedAttrition,
       destroyed,

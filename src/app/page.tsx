@@ -1136,15 +1136,6 @@ export default function Home() {
         )}
       </div>
 
-      <h2>Other Unit Combat Power</h2>
-      <div style={{ marginBottom: 18 }}>
-        {otherComputedRows.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No “other” units (for current search filter).</div>
-        ) : (
-          renderCombatPowerBar("Other", otherTotals)
-        )}
-      </div>
-
       <h2>163 BNs Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sorted163UnitSummaries.length === 0 ? (
