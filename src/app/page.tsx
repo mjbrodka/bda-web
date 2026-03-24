@@ -74,6 +74,8 @@ function newRow(day: number): TrackerRow {
  * - "1632 IN" -> "1632"
  * - "165 OS/SS BN", "165 OSSS", "165 OS-SS" -> "165 OS/SS"
  * - "163 OS/SS BN", "163 OSSS", "163 OS-SS" -> "163 OS/SS"
+ * - "165 MCP" -> "165"
+ * - "165 CP" -> "165"
  *
  * Important:
  * - Bare "OS/SS" stays "OS/SS"
@@ -121,21 +123,25 @@ function canonicalBn(raw: unknown) {
 }
 
 /**
- * STRICT brigade membership rules:
- * - 163 BCG: only 163xxxx style BNs OR "163 OS/SS"
- * - 165 BCG: only 165xxxx style BNs OR "165 OS/SS"
- * - everything else is NOT brigade rollup material
+ * Brigade membership rules:
+ * - anything whose canonical BN starts with 163 belongs to 163 BCG
+ * - anything whose canonical BN starts with 165 belongs to 165 BCG
  *
- * This prevents units like 7131, 168, 169, or bare OS/SS from leaking into brigade totals.
+ * This allows:
+ * - 1631, 1632, 163 OS/SS, 163 CP, 163 MCP
+ * - 1651, 1652, 165 OS/SS, 165 CP, 165 MCP
+ *
+ * But still excludes:
+ * - 7131, 168, 169, bare OS/SS
  */
 function is163BcgUnit(bn: unknown) {
   const c = canonicalBn(bn);
-  return c === "163 OS/SS" || /^163\d+$/.test(c);
+  return c.startsWith("163");
 }
 
 function is165BcgUnit(bn: unknown) {
   const c = canonicalBn(bn);
-  return c === "165 OS/SS" || /^165\d+$/.test(c);
+  return c.startsWith("165");
 }
 
 function isAmbiguousOsSs(bn: unknown) {
@@ -437,10 +443,6 @@ export default function Home() {
     });
   }, [rows, query]);
 
-  /**
-   * We canonicalize BN for compute/grouping only.
-   * This keeps battalion rollups clean while preserving the user's raw input in the editable table.
-   */
   const filteredComputedInputRows = useMemo(() => {
     return filteredInputRows.map((r) => ({
       ...r,
@@ -453,11 +455,6 @@ export default function Home() {
     [filteredComputedInputRows, day, useAttrition]
   );
 
-  /**
-   * STRICT top brigade totals
-   * These are the critical filters that prevent 7131 / 168 / 169 / other units
-   * from affecting 163 BCG or 165 BCG.
-   */
   const bcg163ComputedRows = useMemo(
     () => computedRows.filter((r) => is163BcgUnit(r.bn)),
     [computedRows]
@@ -489,14 +486,6 @@ export default function Home() {
     return { onHand, remaining, destroyed, combatPowerPct };
   }, [bcg165ComputedRows]);
 
-  /**
-   * Battalion summaries:
-   * - 163 brigade battalions shown under 163 BNs
-   * - 165 brigade battalions shown under 165 BNs
-   * - everything else shown under Other Units
-   *
-   * This still lets 7131 aggregate as 7131, 168 as 168, etc.
-   */
   const bcg163UnitSummaries = useMemo(
     () => bnSummaries.filter((bn) => is163BcgUnit(bn.bn)),
     [bnSummaries]
