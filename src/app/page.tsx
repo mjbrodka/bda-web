@@ -111,6 +111,7 @@ function canonicalBn(raw: unknown) {
   ) {
     return "OS/SS";
   }
+
   if (/^OS\s*[-/&]?\s*SS(\s*BN)?$/i.test(s)) return "OS/SS";
 
   const m = s.match(/^(\d{3,6})\b/);
@@ -119,20 +120,22 @@ function canonicalBn(raw: unknown) {
   return s;
 }
 
-function getBrigadeGroup(bn: unknown): "163" | "165" | "OTHER" {
-  const c = canonicalBn(bn);
-  if (!c) return "OTHER";
-  if (c.startsWith("163")) return "163";
-  if (c.startsWith("165")) return "165";
-  return "OTHER";
-}
-
+/**
+ * STRICT brigade membership rules:
+ * - 163 BCG: only 163xxxx style BNs OR "163 OS/SS"
+ * - 165 BCG: only 165xxxx style BNs OR "165 OS/SS"
+ * - everything else is NOT brigade rollup material
+ *
+ * This prevents units like 7131, 168, 169, or bare OS/SS from leaking into brigade totals.
+ */
 function is163BcgUnit(bn: unknown) {
-  return getBrigadeGroup(bn) === "163";
+  const c = canonicalBn(bn);
+  return c === "163 OS/SS" || /^163\d+$/.test(c);
 }
 
 function is165BcgUnit(bn: unknown) {
-  return getBrigadeGroup(bn) === "165";
+  const c = canonicalBn(bn);
+  return c === "165 OS/SS" || /^165\d+$/.test(c);
 }
 
 function isAmbiguousOsSs(bn: unknown) {
@@ -434,6 +437,10 @@ export default function Home() {
     });
   }, [rows, query]);
 
+  /**
+   * We canonicalize BN for compute/grouping only.
+   * This keeps battalion rollups clean while preserving the user's raw input in the editable table.
+   */
   const filteredComputedInputRows = useMemo(() => {
     return filteredInputRows.map((r) => ({
       ...r,
@@ -446,10 +453,16 @@ export default function Home() {
     [filteredComputedInputRows, day, useAttrition]
   );
 
+  /**
+   * STRICT top brigade totals
+   * These are the critical filters that prevent 7131 / 168 / 169 / other units
+   * from affecting 163 BCG or 165 BCG.
+   */
   const bcg163ComputedRows = useMemo(
     () => computedRows.filter((r) => is163BcgUnit(r.bn)),
     [computedRows]
   );
+
   const bcg165ComputedRows = useMemo(
     () => computedRows.filter((r) => is165BcgUnit(r.bn)),
     [computedRows]
@@ -476,14 +489,24 @@ export default function Home() {
     return { onHand, remaining, destroyed, combatPowerPct };
   }, [bcg165ComputedRows]);
 
+  /**
+   * Battalion summaries:
+   * - 163 brigade battalions shown under 163 BNs
+   * - 165 brigade battalions shown under 165 BNs
+   * - everything else shown under Other Units
+   *
+   * This still lets 7131 aggregate as 7131, 168 as 168, etc.
+   */
   const bcg163UnitSummaries = useMemo(
     () => bnSummaries.filter((bn) => is163BcgUnit(bn.bn)),
     [bnSummaries]
   );
+
   const bcg165UnitSummaries = useMemo(
     () => bnSummaries.filter((bn) => is165BcgUnit(bn.bn)),
     [bnSummaries]
   );
+
   const otherUnitSummaries = useMemo(
     () => bnSummaries.filter((bn) => !is163BcgUnit(bn.bn) && !is165BcgUnit(bn.bn)),
     [bnSummaries]
@@ -491,9 +514,11 @@ export default function Home() {
 
   function sortSummaries(list: typeof bnSummaries) {
     const arr = [...list];
-    if (sortMode === "BN_ASC") arr.sort((a, b) => String(a.bn).localeCompare(String(b.bn)));
-    else if (sortMode === "BN_DESC") arr.sort((a, b) => String(b.bn).localeCompare(String(a.bn)));
-    else if (sortMode === "CP_ASC") {
+    if (sortMode === "BN_ASC") {
+      arr.sort((a, b) => String(a.bn).localeCompare(String(b.bn)));
+    } else if (sortMode === "BN_DESC") {
+      arr.sort((a, b) => String(b.bn).localeCompare(String(a.bn)));
+    } else if (sortMode === "CP_ASC") {
       arr.sort(
         (a, b) =>
           (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) ||
@@ -530,6 +555,7 @@ export default function Home() {
       saved_by_email: email,
       saved_by_user_id: userId,
     });
+
     if (error) {
       setStatus((s) => (s.includes("History") ? s : `${s} (History write failed: ${error.message})`));
     }
@@ -933,7 +959,7 @@ export default function Home() {
           <div style={{ fontSize: 13 }}>
             OS/SS units must include a brigade prefix to roll up correctly, for example{" "}
             <strong>163 OS/SS</strong> or <strong>165 OS/SS</strong>. Bare <strong>OS/SS</strong> entries
-            remain in <strong>Other</strong> and do not count toward either brigade total.
+            do not count toward either brigade total.
           </div>
           <div style={{ marginTop: 8, fontSize: 12, fontFamily: "monospace" }}>
             Rows affected: {ambiguousOsSsRows.map((r) => r.bn || "(blank)").join(", ")}
@@ -1149,7 +1175,7 @@ export default function Home() {
       <h2>Other Units Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedOtherUnitSummaries.length === 0 ? (
-          <div style={{ opacity: 0.8 }}>No “other” units (for current search filter).</div>
+          <div style={{ opacity: 0.8 }}>No other units (for current search filter).</div>
         ) : (
           renderBnBars(sortedOtherUnitSummaries)
         )}
