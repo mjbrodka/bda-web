@@ -406,12 +406,16 @@ export default function Home() {
   }
 
   function updateDestroyedByDay(id: string, idx: number, value: number) {
+    const effectiveDay = clampInt(idx + 1, 1, 5);
+
+    setDay(effectiveDay);
+
     setRows((prev) =>
       prev.map((r) => {
         if (r.id !== id) return r;
         const byDay = normalizeDestroyedByDay(r.destroyedByDay);
         byDay[idx] = Math.max(0, Math.floor(Number(value) || 0));
-        const pct = inferDailyAttritionPct(r.onHand, byDay, day);
+        const pct = inferDailyAttritionPct(r.onHand, byDay, effectiveDay);
         return { ...r, destroyedByDay: byDay, dailyAttritionPct: pct };
       })
     );
@@ -450,10 +454,6 @@ export default function Home() {
     () => computedRows.filter((r) => is165BcgUnit(r.bn)),
     [computedRows]
   );
-  const otherComputedRows = useMemo(
-    () => computedRows.filter((r) => !is163BcgUnit(r.bn) && !is165BcgUnit(r.bn)),
-    [computedRows]
-  );
 
   const ambiguousOsSsRows = useMemo(
     () => rows.filter((r) => isAmbiguousOsSs(r.bn)),
@@ -475,14 +475,6 @@ export default function Home() {
     const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
     return { onHand, remaining, destroyed, combatPowerPct };
   }, [bcg165ComputedRows]);
-
-  const otherTotals = useMemo(() => {
-    const onHand = otherComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
-    const remaining = otherComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
-    const destroyed = otherComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
-    const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
-    return { onHand, remaining, destroyed, combatPowerPct };
-  }, [otherComputedRows]);
 
   const bcg163UnitSummaries = useMemo(
     () => bnSummaries.filter((bn) => is163BcgUnit(bn.bn)),
