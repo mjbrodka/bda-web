@@ -71,16 +71,33 @@ function newRow(day: number): TrackerRow {
 /**
  * Canonicalize BN labels so grouping works:
  * - "1651 AR" -> "1651"
- * - "1654 IN" -> "1654"
- * - "OS/SS BN", "OSSS", "OS-SS" -> "OS/SS"
- * - "OS XYZ" stays "OS XYZ" (but will still count as 165 group because it starts with OS)
+ * - "1632 IN" -> "1632"
+ * - "165 OS/SS BN", "165 OSSS", "165 OS-SS" -> "165 OS/SS"
+ * - "163 OS/SS BN", "163 OSSS", "163 OS-SS" -> "163 OS/SS"
+ *
+ * Important:
+ * - Bare "OS/SS" stays "OS/SS"
+ * - Bare "OS/SS" is ambiguous and must not roll into 163 or 165
  */
 function canonicalBn(raw: unknown) {
   let s = String(raw ?? "").trim().toUpperCase().replace(/\s+/g, " ");
   if (!s) return "";
 
-  // Normalize OS/SS variants first
+  s = s.replace(/\\/g, "/");
+
+  const prefixedOsSsMatch = s.match(
+    /^(\d{3})\s*[- ]?\s*(OS\/SS|OSSS|OS-SS|OS\s*&\s*SS|OS\s+AND\s+SS)(?:\s*BN)?$/i
+  );
+  if (prefixedOsSsMatch) {
+    return `${prefixedOsSsMatch[1]} OS/SS`;
+  }
+
   const sNoSpace = s.replace(/\s+/g, "");
+  const prefixedCompactMatch = sNoSpace.match(/^(\d{3})(OS\/SS|OSSS|OS-SS|OS&SS|OSANDSS)(BN)?$/i);
+  if (prefixedCompactMatch) {
+    return `${prefixedCompactMatch[1]} OS/SS`;
+  }
+
   if (
     sNoSpace === "OS/SS" ||
     sNoSpace === "OS/SSBN" ||
@@ -94,20 +111,32 @@ function canonicalBn(raw: unknown) {
   ) {
     return "OS/SS";
   }
-  // Also catch strings like "OS/SS BN" or "OS-SS BN" etc.
   if (/^OS\s*[-/&]?\s*SS(\s*BN)?$/i.test(s)) return "OS/SS";
 
-  // If it starts with digits, keep the leading numeric token only: "1651 AR" -> "1651"
   const m = s.match(/^(\d{3,6})\b/);
   if (m) return m[1];
 
   return s;
 }
 
-// ---- 165 group membership: prefix rule (165* or OS*) ----
-function is165BcgUnit(bn: unknown) {
+function getBrigadeGroup(bn: unknown): "163" | "165" | "OTHER" {
   const c = canonicalBn(bn);
-  return c.startsWith("165") || c.startsWith("OS");
+  if (!c) return "OTHER";
+  if (c.startsWith("163")) return "163";
+  if (c.startsWith("165")) return "165";
+  return "OTHER";
+}
+
+function is163BcgUnit(bn: unknown) {
+  return getBrigadeGroup(bn) === "163";
+}
+
+function is165BcgUnit(bn: unknown) {
+  return getBrigadeGroup(bn) === "165";
+}
+
+function isAmbiguousOsSs(bn: unknown) {
+  return canonicalBn(bn) === "OS/SS";
 }
 
 type TrackerState = {
@@ -244,24 +273,20 @@ export default function Home() {
   const [isAuthed, setIsAuthed] = useState<boolean>(false);
   const [status, setStatus] = useState<string>("");
 
-  // Editor gating (source of truth: public.tracker_editor_emails)
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [isEditor, setIsEditor] = useState<boolean>(false);
   const [editorChecked, setEditorChecked] = useState<boolean>(false);
 
-  // Search + sort + last-updated display
   const [query, setQuery] = useState<string>("");
   const [sortMode, setSortMode] = useState<SortMode>("BN_ASC");
 
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [lastUpdatedBy, setLastUpdatedBy] = useState<string | null>(null);
 
-  // History UI
   const [showHistory, setShowHistory] = useState(false);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [history, setHistory] = useState<HistoryRow[]>([]);
 
-  // Throttle history snapshots (autosave can be frequent)
   const lastHistoryWriteAtRef = useRef<number>(0);
 
   const readOnly = editorChecked ? !isEditor : true;
@@ -270,9 +295,6 @@ export default function Home() {
     const e = normalizeEmail(email);
     if (!e) return false;
 
-    // Preferred: ask the allowlist table directly.
-    // NOTE: This requires tracker_editor_emails to be readable to authenticated users,
-    // or you can loosen with a policy: SELECT to authenticated using (true).
     const { data, error } = await supabase
       .from("tracker_editor_emails")
       .select("email")
@@ -280,8 +302,6 @@ export default function Home() {
       .limit(1);
 
     if (error) {
-      // If the editor table is not readable due to RLS, don't spam viewers;
-      // fail closed (viewer) and show one status for debugging.
       setStatus(`Editor check failed (defaulting to viewer): ${error.message}`);
       return false;
     }
@@ -310,7 +330,6 @@ export default function Home() {
     }
   }
 
-  // ---- LOAD on mount ----
   useEffect(() => {
     (async () => {
       setStatus("Loading…");
@@ -327,7 +346,6 @@ export default function Home() {
         return;
       }
 
-      // Determine editor status (fail closed to viewer)
       const editor = await checkIsEditor(email);
       setIsEditor(editor);
       setEditorChecked(true);
@@ -363,7 +381,6 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- setters that keep attrition inference consistent ----
   function setDayAndRecalc(nextDay: number | string) {
     const d = clampInt(nextDay, 1, 5);
     setDay(d);
@@ -404,7 +421,6 @@ export default function Home() {
     setRows((prev) => prev.filter((r) => r.id !== id));
   }
 
-  // ---- Filter rows for display + compute ----
   const filteredInputRows = useMemo(() => {
     const q = normalizeKey(query);
     if (!q) return rows;
@@ -414,11 +430,6 @@ export default function Home() {
     });
   }, [rows, query]);
 
-  /**
-   * IMPORTANT FIX:
-   * Canonicalize BN *before* computeRows so summaries group correctly.
-   * This is what fixes "1651 AR" showing under Other Units.
-   */
   const filteredComputedInputRows = useMemo(() => {
     return filteredInputRows.map((r) => ({
       ...r,
@@ -426,52 +437,99 @@ export default function Home() {
     }));
   }, [filteredInputRows]);
 
-  // ---- compute (based on filtered rows so search affects summaries/bars/computed) ----
   const { bnSummaries, computedRows } = useMemo(
     () => computeRows(filteredComputedInputRows, { day, useAttrition, manualWins: true }),
     [filteredComputedInputRows, day, useAttrition]
   );
 
-  // ---- 165 totals for top bar (computed rows) ----
-  const bcgComputedRows = useMemo(() => computedRows.filter((r) => is165BcgUnit(r.bn)), [computedRows]);
+  const bcg163ComputedRows = useMemo(
+    () => computedRows.filter((r) => is163BcgUnit(r.bn)),
+    [computedRows]
+  );
+  const bcg165ComputedRows = useMemo(
+    () => computedRows.filter((r) => is165BcgUnit(r.bn)),
+    [computedRows]
+  );
+  const otherComputedRows = useMemo(
+    () => computedRows.filter((r) => !is163BcgUnit(r.bn) && !is165BcgUnit(r.bn)),
+    [computedRows]
+  );
 
-  const bcgTotals = useMemo(() => {
-    const onHand = bcgComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
-    const remaining = bcgComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
-    const destroyed = bcgComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
+  const ambiguousOsSsRows = useMemo(
+    () => rows.filter((r) => isAmbiguousOsSs(r.bn)),
+    [rows]
+  );
+
+  const bcg163Totals = useMemo(() => {
+    const onHand = bcg163ComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
+    const remaining = bcg163ComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
+    const destroyed = bcg163ComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
     const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
     return { onHand, remaining, destroyed, combatPowerPct };
-  }, [bcgComputedRows]);
+  }, [bcg163ComputedRows]);
 
-  const bcgRemPct = bcgTotals.onHand > 0 ? (bcgTotals.remaining / bcgTotals.onHand) * 100 : 0;
-  const bcgDesPct = bcgTotals.onHand > 0 ? (bcgTotals.destroyed / bcgTotals.onHand) * 100 : 0;
+  const bcg165Totals = useMemo(() => {
+    const onHand = bcg165ComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
+    const remaining = bcg165ComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
+    const destroyed = bcg165ComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
+    const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
+    return { onHand, remaining, destroyed, combatPowerPct };
+  }, [bcg165ComputedRows]);
 
-  // ---- Split BN summaries into 165 group + other (bars by unit) ----
-  const bcgUnitSummaries = useMemo(() => bnSummaries.filter((bn) => is165BcgUnit(bn.bn)), [bnSummaries]);
-  const otherUnitSummaries = useMemo(() => bnSummaries.filter((bn) => !is165BcgUnit(bn.bn)), [bnSummaries]);
+  const otherTotals = useMemo(() => {
+    const onHand = otherComputedRows.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
+    const remaining = otherComputedRows.reduce((s, r) => s + (Number(r.remaining) || 0), 0);
+    const destroyed = otherComputedRows.reduce((s, r) => s + (Number(r.destroyed) || 0), 0);
+    const combatPowerPct = onHand > 0 ? (remaining / onHand) * 100 : 0;
+    return { onHand, remaining, destroyed, combatPowerPct };
+  }, [otherComputedRows]);
 
-  // ---- Sort helpers ----
+  const bcg163UnitSummaries = useMemo(
+    () => bnSummaries.filter((bn) => is163BcgUnit(bn.bn)),
+    [bnSummaries]
+  );
+  const bcg165UnitSummaries = useMemo(
+    () => bnSummaries.filter((bn) => is165BcgUnit(bn.bn)),
+    [bnSummaries]
+  );
+  const otherUnitSummaries = useMemo(
+    () => bnSummaries.filter((bn) => !is163BcgUnit(bn.bn) && !is165BcgUnit(bn.bn)),
+    [bnSummaries]
+  );
+
   function sortSummaries(list: typeof bnSummaries) {
     const arr = [...list];
     if (sortMode === "BN_ASC") arr.sort((a, b) => String(a.bn).localeCompare(String(b.bn)));
     else if (sortMode === "BN_DESC") arr.sort((a, b) => String(b.bn).localeCompare(String(a.bn)));
-    else if (sortMode === "CP_ASC")
+    else if (sortMode === "CP_ASC") {
       arr.sort(
         (a, b) =>
-          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+          (a.combatPowerPct ?? 0) - (b.combatPowerPct ?? 0) ||
+          String(a.bn).localeCompare(String(b.bn))
       );
-    else
+    } else {
       arr.sort(
         (a, b) =>
-          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) || String(a.bn).localeCompare(String(b.bn))
+          (b.combatPowerPct ?? 0) - (a.combatPowerPct ?? 0) ||
+          String(a.bn).localeCompare(String(b.bn))
       );
+    }
     return arr;
   }
 
-  // Keep the all-units list for the summary tables below
   const sortedBnSummaries = useMemo(() => sortSummaries(bnSummaries), [bnSummaries, sortMode]);
-  const sortedBcgUnitSummaries = useMemo(() => sortSummaries(bcgUnitSummaries), [bcgUnitSummaries, sortMode]);
-  const sortedOtherUnitSummaries = useMemo(() => sortSummaries(otherUnitSummaries), [otherUnitSummaries, sortMode]);
+  const sorted163UnitSummaries = useMemo(
+    () => sortSummaries(bcg163UnitSummaries),
+    [bcg163UnitSummaries, sortMode]
+  );
+  const sorted165UnitSummaries = useMemo(
+    () => sortSummaries(bcg165UnitSummaries),
+    [bcg165UnitSummaries, sortMode]
+  );
+  const sortedOtherUnitSummaries = useMemo(
+    () => sortSummaries(otherUnitSummaries),
+    [otherUnitSummaries, sortMode]
+  );
 
   async function writeHistorySnapshot(stateToSave: TrackerState, email: string | null, userId: string | null) {
     const { error } = await supabase.from("global_tracker_state_history").insert({
@@ -539,11 +597,10 @@ export default function Home() {
     await loadHistory();
   }
 
-  // ---- AUTOSAVE (editors only; never run for viewers) ----
   const saveTimer = useRef<number | null>(null);
   useEffect(() => {
     if (!isAuthed) return;
-    if (readOnly) return; // ✅ viewers never autosave
+    if (readOnly) return;
 
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
 
@@ -626,6 +683,7 @@ export default function Home() {
       "Destroyed D4",
       "Destroyed D5",
     ];
+
     const data = rows.map((r) => {
       const d = normalizeDestroyedByDay(r.destroyedByDay);
       return {
@@ -639,6 +697,7 @@ export default function Home() {
         "Destroyed D5": d[4] || 0,
       };
     });
+
     const ws = XLSX.utils.json_to_sheet(data, { header });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "BDA");
@@ -653,6 +712,7 @@ export default function Home() {
       alert("Upload a .xlsx Excel file only.");
       return;
     }
+
     const data = await file.arrayBuffer();
     const workbook = XLSX.read(data);
     const sheetName = workbook.SheetNames[0];
@@ -688,7 +748,7 @@ export default function Home() {
 
         return {
           id: crypto.randomUUID(),
-          bn, // keep raw, canonicalization happens in compute stage
+          bn,
           equipmentType,
           onHand,
           destroyedByDay: byDay,
@@ -712,9 +772,77 @@ export default function Home() {
     if (file) importExcel(file, "replace");
   }
 
+  function renderCombatPowerBar(
+    label: string,
+    totals: { onHand: number; remaining: number; destroyed: number; combatPowerPct: number }
+  ) {
+    const remPct = totals.onHand > 0 ? (totals.remaining / totals.onHand) * 100 : 0;
+    const desPct = totals.onHand > 0 ? (totals.destroyed / totals.onHand) * 100 : 0;
+
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "110px 1fr 320px", gap: 10, alignItems: "center" }}>
+        <div style={{ fontWeight: 700 }}>{label}</div>
+        <div
+          style={{
+            height: 18,
+            border: "1px solid #444",
+            display: "flex",
+            overflow: "hidden",
+            background: "#111",
+          }}
+        >
+          <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
+          <div style={{ width: `${desPct}%`, background: "#b3261e" }} />
+        </div>
+        <div style={{ fontFamily: "monospace" }}>
+          CP {totals.combatPowerPct.toFixed(1)}% | Rem {totals.remaining} | Des {totals.destroyed}
+        </div>
+      </div>
+    );
+  }
+
+  function renderBnBars(list: typeof bnSummaries) {
+    return (
+      <div style={{ display: "grid", gap: 10 }}>
+        {list.map((bn) => {
+          const total = bn.onHand || 0;
+          const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
+          const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
+          const ambiguous = isAmbiguousOsSs(bn.bn);
+
+          return (
+            <div
+              key={bn.bn}
+              style={{ display: "grid", gridTemplateColumns: "110px 1fr 320px", gap: 10, alignItems: "center" }}
+            >
+              <div style={{ fontWeight: 600, color: ambiguous ? "#ff8a80" : undefined }}>
+                {bn.bn}
+                {ambiguous ? " *" : ""}
+              </div>
+              <div
+                style={{
+                  height: 18,
+                  border: ambiguous ? "1px solid #ff5252" : "1px solid #444",
+                  display: "flex",
+                  overflow: "hidden",
+                  background: "#111",
+                }}
+              >
+                <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
+                <div style={{ width: `${desPct}%`, background: "#b3261e" }} />
+              </div>
+              <div style={{ fontFamily: "monospace", color: ambiguous ? "#ff8a80" : undefined }}>
+                CP {bn.combatPowerPct.toFixed(1)}% | Rem {bn.remaining} | Des {bn.destroyed}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   return (
     <main style={{ padding: 20, maxWidth: 1200 }}>
-      {/* Header */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
         <div style={{ display: "grid", gap: 6 }}>
           <h1 style={{ margin: 0 }}>BDA Tracker</h1>
@@ -732,12 +860,18 @@ export default function Home() {
 
             {editorChecked ? (
               readOnly ? (
-                <span style={badgeStyle("rgba(255, 193, 7, 0.15)", "rgba(255, 193, 7, 0.95)")}>Read-only (viewer)</span>
+                <span style={badgeStyle("rgba(255, 193, 7, 0.15)", "rgba(255, 193, 7, 0.95)")}>
+                  Read-only (viewer)
+                </span>
               ) : (
-                <span style={badgeStyle("rgba(0, 255, 163, 0.12)", "rgba(0, 255, 163, 0.95)")}>Editor</span>
+                <span style={badgeStyle("rgba(0, 255, 163, 0.12)", "rgba(0, 255, 163, 0.95)")}>
+                  Editor
+                </span>
               )
             ) : (
-              <span style={badgeStyle("rgba(160,160,160,0.12)", "rgba(220,220,220,0.95)")}>Checking access…</span>
+              <span style={badgeStyle("rgba(160,160,160,0.12)", "rgba(220,220,220,0.95)")}>
+                Checking access…
+              </span>
             )}
 
             {userEmail ? (
@@ -775,7 +909,9 @@ export default function Home() {
 
           <button onClick={() => setSortMode((m) => cycleSort(m))}>Sort: {sortLabel(sortMode)}</button>
 
-          <button onClick={() => setShowHistory((v) => !v)}>{showHistory ? "Hide History" : "History / Rollback"}</button>
+          <button onClick={() => setShowHistory((v) => !v)}>
+            {showHistory ? "Hide History" : "History / Rollback"}
+          </button>
 
           <div style={{ fontFamily: "monospace", opacity: 0.8 }}>{status}</div>
 
@@ -789,7 +925,30 @@ export default function Home() {
         </div>
       </div>
 
-      {/* History panel */}
+      {ambiguousOsSsRows.length > 0 ? (
+        <div
+          style={{
+            marginTop: 14,
+            marginBottom: 18,
+            padding: "12px 14px",
+            border: "1px solid rgba(255, 82, 82, 0.5)",
+            borderRadius: 10,
+            background: "rgba(255, 82, 82, 0.08)",
+            color: "#ffd0d0",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Ambiguous OS/SS entries detected</div>
+          <div style={{ fontSize: 13 }}>
+            OS/SS units must include a brigade prefix to roll up correctly, for example{" "}
+            <strong>163 OS/SS</strong> or <strong>165 OS/SS</strong>. Bare <strong>OS/SS</strong> entries
+            remain in <strong>Other</strong> and do not count toward either brigade total.
+          </div>
+          <div style={{ marginTop: 8, fontSize: 12, fontFamily: "monospace" }}>
+            Rows affected: {ambiguousOsSsRows.map((r) => r.bn || "(blank)").join(", ")}
+          </div>
+        </div>
+      ) : null}
+
       {showHistory ? (
         <div style={{ border: "1px solid #444", padding: 12, marginTop: 12, marginBottom: 18, background: "#111" }}>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -801,7 +960,9 @@ export default function Home() {
               Autosave snapshots are throttled (max ~1/min). Manual Save and Restore always snapshot.
             </div>
             {editorChecked && readOnly ? (
-              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.85 }}>Restore is disabled in view-only mode.</div>
+              <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.85 }}>
+                Restore is disabled in view-only mode.
+              </div>
             ) : null}
           </div>
 
@@ -852,7 +1013,6 @@ export default function Home() {
         </div>
       ) : null}
 
-      {/* Upload */}
       <h2>Upload Excel (.xlsx)</h2>
       <div
         onDragEnter={(e) => {
@@ -933,7 +1093,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Controls */}
       <div style={{ display: "flex", gap: 20, marginBottom: 20, flexWrap: "wrap" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <div style={{ width: 60 }}>Day</div>
@@ -947,6 +1106,7 @@ export default function Home() {
           />
           <div style={{ width: 70, textAlign: "right" }}>Day {day}</div>
         </div>
+
         <label style={{ display: "flex", gap: 8, alignItems: "center", opacity: readOnly ? 0.65 : 1 }}>
           <input
             type="checkbox"
@@ -958,90 +1118,60 @@ export default function Home() {
         </label>
       </div>
 
-      {/* 165 BCG Total Bar */}
+      <h2>163 BCG Total Combat Power</h2>
+      <div style={{ marginBottom: 18 }}>
+        {bcg163ComputedRows.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No 163 BN data yet (for current search filter).</div>
+        ) : (
+          renderCombatPowerBar("163 BCG", bcg163Totals)
+        )}
+      </div>
+
       <h2>165 BCG Total Combat Power</h2>
       <div style={{ marginBottom: 18 }}>
-        {bcgComputedRows.length === 0 ? (
+        {bcg165ComputedRows.length === 0 ? (
           <div style={{ opacity: 0.8 }}>No 165 BN data yet (for current search filter).</div>
         ) : (
-          <div style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}>
-            <div style={{ fontWeight: 700 }}>165 BCG</div>
-            <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
-              <div style={{ width: `${bcgRemPct}%`, background: "#1f8f3a" }} />
-              <div style={{ width: `${bcgDesPct}%`, background: "#b3261e" }} />
-            </div>
-            <div style={{ fontFamily: "monospace" }}>
-              CP {bcgTotals.combatPowerPct.toFixed(1)}% | Rem {bcgTotals.remaining} | Des {bcgTotals.destroyed}
-            </div>
-          </div>
+          renderCombatPowerBar("165 BCG", bcg165Totals)
         )}
       </div>
 
-      {/* 165 BNs Combat Power */}
+      <h2>Other Unit Combat Power</h2>
+      <div style={{ marginBottom: 18 }}>
+        {otherComputedRows.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No “other” units (for current search filter).</div>
+        ) : (
+          renderCombatPowerBar("Other", otherTotals)
+        )}
+      </div>
+
+      <h2>163 BNs Combat Power</h2>
+      <div style={{ marginBottom: 10 }}>
+        {sorted163UnitSummaries.length === 0 ? (
+          <div style={{ opacity: 0.8 }}>No 163 BN data (for current search filter).</div>
+        ) : (
+          renderBnBars(sorted163UnitSummaries)
+        )}
+      </div>
+
       <h2>165 BNs Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
-        {sortedBcgUnitSummaries.length === 0 ? (
+        {sorted165UnitSummaries.length === 0 ? (
           <div style={{ opacity: 0.8 }}>No 165 BN data (for current search filter).</div>
         ) : (
-          <div style={{ display: "grid", gap: 10 }}>
-            {sortedBcgUnitSummaries.map((bn) => {
-              const total = bn.onHand || 0;
-              const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
-              const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
-
-              return (
-                <div
-                  key={bn.bn}
-                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
-                >
-                  <div style={{ fontWeight: 600 }}>{bn.bn}</div>
-                  <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
-                    <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
-                    <div style={{ width: `${desPct}%`, background: "#b3261e" }} />
-                  </div>
-                  <div style={{ fontFamily: "monospace" }}>
-                    CP {bn.combatPowerPct.toFixed(1)}% | Rem {bn.remaining} | Des {bn.destroyed}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          renderBnBars(sorted165UnitSummaries)
         )}
       </div>
 
-      {/* Other units combat power */}
-      <h2>Other Unit Combat Power</h2>
+      <h2>Other Units Combat Power</h2>
       <div style={{ marginBottom: 10 }}>
         {sortedOtherUnitSummaries.length === 0 ? (
           <div style={{ opacity: 0.8 }}>No “other” units (for current search filter).</div>
         ) : (
-          <div style={{ display: "grid", gap: 10 }}>
-            {sortedOtherUnitSummaries.map((bn) => {
-              const total = bn.onHand || 0;
-              const remPct = total > 0 ? (bn.remaining / total) * 100 : 0;
-              const desPct = total > 0 ? (bn.destroyed / total) * 100 : 0;
-
-              return (
-                <div
-                  key={bn.bn}
-                  style={{ display: "grid", gridTemplateColumns: "90px 1fr 320px", gap: 10, alignItems: "center" }}
-                >
-                  <div style={{ fontWeight: 600 }}>{bn.bn}</div>
-                  <div style={{ height: 18, border: "1px solid #444", display: "flex", overflow: "hidden", background: "#111" }}>
-                    <div style={{ width: `${remPct}%`, background: "#1f8f3a" }} />
-                    <div style={{ width: `${desPct}%`, background: "#b3261e" }} />
-                  </div>
-                  <div style={{ fontFamily: "monospace" }}>
-                    CP {bn.combatPowerPct.toFixed(1)}% | Rem {bn.remaining} | Des {bn.destroyed}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          renderBnBars(sortedOtherUnitSummaries)
         )}
       </div>
 
-      {/* Row actions */}
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginBottom: 12 }}>
         <button disabled={readOnly} onClick={() => setRows((p) => [...p, newRow(day)])}>
           + Add Row
@@ -1051,7 +1181,6 @@ export default function Home() {
         </button>
       </div>
 
-      {/* Input Rows */}
       <h2>Input Rows</h2>
       <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
         Showing {filteredInputRows.length} of {rows.length} rows
@@ -1060,7 +1189,7 @@ export default function Home() {
       <table border={1} cellPadding={6} style={{ width: "100%", marginBottom: 18 }}>
         <thead>
           <tr>
-            <th style={{ width: 90 }}>UNIT</th>
+            <th style={{ width: 120 }}>UNIT</th>
             <th>Equipment Type</th>
             <th style={{ width: 90 }}>On Hand</th>
             <th style={{ width: 90 }}>D1</th>
@@ -1078,14 +1207,24 @@ export default function Home() {
             const d = normalizeDestroyedByDay(r.destroyedByDay);
             const totalDestroyed = d.reduce((s, v) => s + v, 0);
             const inferred = inferDailyAttritionPct(r.onHand, d, day);
+            const ambiguous = isAmbiguousOsSs(r.bn);
 
             return (
-              <tr key={r.id}>
+              <tr
+                key={r.id}
+                style={{
+                  background: ambiguous ? "rgba(255, 82, 82, 0.08)" : undefined,
+                }}
+              >
                 <td>
                   <input
                     value={r.bn}
                     onChange={(e) => updateRow(r.id, { bn: e.target.value })}
-                    style={{ width: "100%" }}
+                    style={{
+                      width: "100%",
+                      border: ambiguous ? "2px solid #ff5252" : undefined,
+                      outline: "none",
+                    }}
                     disabled={readOnly}
                   />
                 </td>
@@ -1119,8 +1258,12 @@ export default function Home() {
                     />
                   </td>
                 ))}
-                <td style={{ fontFamily: "monospace", textAlign: "right" }}>{totalDestroyed}</td>
-                <td style={{ fontFamily: "monospace", textAlign: "right" }}>{inferred.toFixed(2)}%</td>
+                <td style={{ fontFamily: "monospace", textAlign: "right", color: ambiguous ? "#ff8a80" : undefined }}>
+                  {totalDestroyed}
+                </td>
+                <td style={{ fontFamily: "monospace", textAlign: "right", color: ambiguous ? "#ff8a80" : undefined }}>
+                  {inferred.toFixed(2)}%
+                </td>
                 <td>
                   <button disabled={readOnly} onClick={() => deleteRow(r.id)}>
                     Delete
@@ -1140,7 +1283,6 @@ export default function Home() {
         </tbody>
       </table>
 
-      {/* Unit Summary (all units) */}
       <h2>Unit Summary</h2>
       <table border={1} cellPadding={6} style={{ width: 860, marginBottom: 18 }}>
         <thead>
@@ -1154,16 +1296,27 @@ export default function Home() {
           </tr>
         </thead>
         <tbody>
-          {sortedBnSummaries.map((bn) => (
-            <tr key={bn.bn}>
-              <td>{bn.bn}</td>
-              <td>{bn.onHand}</td>
-              <td>{bn.remaining}</td>
-              <td>{bn.destroyed}</td>
-              <td>{bn.combatPowerPct.toFixed(1)}%</td>
-              <td>{bn.daysTo25Pct ?? "N/A"}</td>
-            </tr>
-          ))}
+          {sortedBnSummaries.map((bn) => {
+            const ambiguous = isAmbiguousOsSs(bn.bn);
+            return (
+              <tr
+                key={bn.bn}
+                style={{
+                  background: ambiguous ? "rgba(255, 82, 82, 0.08)" : undefined,
+                }}
+              >
+                <td style={{ color: ambiguous ? "#ff8a80" : undefined }}>
+                  {bn.bn}
+                  {ambiguous ? " *" : ""}
+                </td>
+                <td>{bn.onHand}</td>
+                <td>{bn.remaining}</td>
+                <td>{bn.destroyed}</td>
+                <td>{bn.combatPowerPct.toFixed(1)}%</td>
+                <td>{bn.daysTo25Pct ?? "N/A"}</td>
+              </tr>
+            );
+          })}
 
           {sortedBnSummaries.length === 0 ? (
             <tr>
@@ -1175,7 +1328,6 @@ export default function Home() {
         </tbody>
       </table>
 
-      {/* Computed Rows */}
       <h2>Computed Rows</h2>
       <table border={1} cellPadding={6} style={{ width: "100%" }}>
         <thead>
@@ -1193,20 +1345,31 @@ export default function Home() {
           </tr>
         </thead>
         <tbody>
-          {computedRows.map((r) => (
-            <tr key={r.id}>
-              <td>{r.bn || "UNSPECIFIED"}</td>
-              <td>{r.equipmentType || "-"}</td>
-              <td>{r.onHand}</td>
-              <td>{r.destroyedManualActive}</td>
-              <td>{r.destroyedManualTotal}</td>
-              <td>{r.destroyedAttrition}</td>
-              <td>{r.destroyed}</td>
-              <td>{r.remaining}</td>
-              <td>{r.combatPowerPct.toFixed(1)}%</td>
-              <td>{r.daysTo25Pct ?? "N/A"}</td>
-            </tr>
-          ))}
+          {computedRows.map((r) => {
+            const ambiguous = isAmbiguousOsSs(r.bn);
+            return (
+              <tr
+                key={r.id}
+                style={{
+                  background: ambiguous ? "rgba(255, 82, 82, 0.08)" : undefined,
+                }}
+              >
+                <td style={{ color: ambiguous ? "#ff8a80" : undefined }}>
+                  {r.bn || "UNSPECIFIED"}
+                  {ambiguous ? " *" : ""}
+                </td>
+                <td>{r.equipmentType || "-"}</td>
+                <td>{r.onHand}</td>
+                <td>{r.destroyedManualActive}</td>
+                <td>{r.destroyedManualTotal}</td>
+                <td>{r.destroyedAttrition}</td>
+                <td>{r.destroyed}</td>
+                <td>{r.remaining}</td>
+                <td>{r.combatPowerPct.toFixed(1)}%</td>
+                <td>{r.daysTo25Pct ?? "N/A"}</td>
+              </tr>
+            );
+          })}
 
           {computedRows.length === 0 ? (
             <tr>

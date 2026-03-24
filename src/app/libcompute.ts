@@ -33,7 +33,7 @@ export type BnSummary = {
   daysTo25Pct: number | null
 }
 
-export type GroupKey = "165_BCG" | "OTHER"
+export type GroupKey = "163_BCG" | "165_BCG" | "OTHER"
 
 export type GroupSummary = {
   group: GroupKey
@@ -47,16 +47,53 @@ export type GroupSummary = {
 /**
  * Canonicalize BN labels so grouping works:
  * - "1651 AR" -> "1651"
- * - "1654 IN" -> "1654"
- * - "OS/SS BN", "OSSS", "OS-SS" -> "OS/SS"
- * - Any unit starting with "OS" stays "OS..." (but counts toward 165 group)
+ * - "1634 IN" -> "1634"
+ * - "165 OS/SS BN", "165 OSSS", "165 OS-SS" -> "165 OS/SS"
+ * - "163 OS/SS BN", "163 OSSS", "163 OS-SS" -> "163 OS/SS"
+ *
+ * Important:
+ * - Bare "OS/SS" remains "OS/SS"
+ * - Bare "OS/SS" does NOT roll into 163 or 165
+ * - This forces the user to specify brigade ownership explicitly
  */
 function normalizeBn(raw: unknown) {
   let s = String(raw ?? "").trim().toUpperCase().replace(/\s+/g, " ")
   if (!s) return ""
 
-  // Normalize OS/SS variants first
+  // Normalize slashes for consistency
+  s = s.replace(/\\/g, "/")
+
+  // 1) Brigade-prefixed OS/SS variants
+  // Examples:
+  //   165 OS/SS
+  //   165 OS/SS BN
+  //   165 OSSS
+  //   165 OS-SS
+  //   165 OS & SS
+  //   165 OS AND SS
+  //   163 OS/SS
+  const prefixedOsSsMatch = s.match(
+    /^(\d{3})\s*[- ]?\s*(OS\/SS|OSSS|OS-SS|OS\s*&\s*SS|OS\s+AND\s+SS)(?:\s*BN)?$/i
+  )
+  if (prefixedOsSsMatch) {
+    return `${prefixedOsSsMatch[1]} OS/SS`
+  }
+
+  // Catch compact forms with spaces removed:
+  //   165OSSS
+  //   165OS/SSBN
+  //   163OSANDSS
   const sNoSpace = s.replace(/\s+/g, "")
+  const prefixedCompactMatch = sNoSpace.match(
+    /^(\d{3})(OS\/SS|OSSS|OS-SS|OS&SS|OSANDSS)(BN)?$/i
+  )
+  if (prefixedCompactMatch) {
+    return `${prefixedCompactMatch[1]} OS/SS`
+  }
+
+  // 2) Bare legacy OS/SS variants
+  // Keep them canonicalized for display consistency,
+  // but do NOT assign them to any brigade group.
   if (
     sNoSpace === "OS/SS" ||
     sNoSpace === "OS/SSBN" ||
@@ -72,7 +109,9 @@ function normalizeBn(raw: unknown) {
   }
   if (/^OS\s*[-/&]?\s*SS(\s*BN)?$/i.test(s)) return "OS/SS"
 
-  // If it starts with digits, keep the leading numeric token only: "1651 AR" -> "1651"
+  // 3) Numeric-leading units keep only the leading numeric token
+  // "1651 AR" -> "1651"
+  // "1632 IN" -> "1632"
   const m = s.match(/^(\d{3,6})\b/)
   if (m) return m[1]
 
@@ -80,14 +119,18 @@ function normalizeBn(raw: unknown) {
 }
 
 /**
- * 165 group membership: prefix rule
- * - Any canonical BN starting with "165" OR "OS" is 165_BCG
- * - Everything else is OTHER
+ * Group membership by brigade prefix.
+ *
+ * Only explicitly prefixed units roll into brigade totals:
+ * - 163... -> 163_BCG
+ * - 165... -> 165_BCG
+ * - bare OS/SS -> OTHER
  */
 function groupForBn(rawBn: unknown): GroupKey {
   const bn = normalizeBn(rawBn)
   if (!bn) return "OTHER"
-  if (bn.startsWith("165") || bn.startsWith("OS")) return "165_BCG"
+  if (bn.startsWith("163")) return "163_BCG"
+  if (bn.startsWith("165")) return "165_BCG"
   return "OTHER"
 }
 
@@ -142,7 +185,7 @@ export function computeRows(
 
   const useAttrition = opts?.useAttrition ?? true
 
-  // If true: destroyed = max(manual, attrition) (your UI uses true)
+  // If true: destroyed = max(manual, attrition)
   // If false: destroyed = attrition (when enabled)
   const manualWins = opts?.manualWins ?? true
 
@@ -159,7 +202,7 @@ export function computeRows(
       destroyedManualTotal = byDay.reduce((s, v) => s + v, 0)
       destroyedManualActive = byDay.slice(0, day).reduce((s, v) => s + v, 0)
     } else {
-      // Legacy single manual destroyed value (assumed "already confirmed")
+      // Legacy single manual destroyed value
       destroyedManualTotal = Math.max(0, Math.floor(safeNum(row.destroyedManual ?? 0)))
       destroyedManualActive = destroyedManualTotal
     }
@@ -184,7 +227,7 @@ export function computeRows(
 
     return {
       ...row,
-      bn: normalizeBn(row.bn), // critical: make BN stable everywhere
+      bn: normalizeBn(row.bn),
       onHand,
       destroyedManual: manual,
       destroyedAttrition,
@@ -221,11 +264,19 @@ export function computeRows(
     bnMap.set(bn, existing)
   }
 
+  const bnRowsByBn = new Map<string, ComputedRow[]>()
+  for (const r of computedRows) {
+    const bn = normalizeBn(r.bn)
+    if (!bn) continue
+    const list = bnRowsByBn.get(bn) ?? []
+    list.push(r)
+    bnRowsByBn.set(bn, list)
+  }
+
   const bnSummaries: BnSummary[] = Array.from(bnMap.values()).map((s) => {
     const combatPowerPct = s.onHand > 0 ? (s.remaining / s.onHand) * 100 : 0
 
-    // Weighted attrition estimate for BN days-to-25
-    const bnRows = computedRows.filter((r) => normalizeBn(r.bn) === s.bn)
+    const bnRows = bnRowsByBn.get(s.bn) ?? []
     const totalWeight = bnRows.reduce((sum, r) => sum + r.onHand, 0)
     const weightedAttrition =
       totalWeight > 0
@@ -239,8 +290,16 @@ export function computeRows(
 
   bnSummaries.sort((a, b) => a.bn.localeCompare(b.bn))
 
-  // Group rollups (165_BCG vs OTHER)
+  // Group rollups
   const groupMap = new Map<GroupKey, GroupSummary>()
+  groupMap.set("163_BCG", {
+    group: "163_BCG",
+    onHand: 0,
+    remaining: 0,
+    destroyed: 0,
+    combatPowerPct: 0,
+    daysTo25Pct: null,
+  })
   groupMap.set("165_BCG", {
     group: "165_BCG",
     onHand: 0,
@@ -258,19 +317,26 @@ export function computeRows(
     daysTo25Pct: null,
   })
 
+  const groupRowsByGroup = new Map<GroupKey, ComputedRow[]>()
+  groupRowsByGroup.set("163_BCG", [])
+  groupRowsByGroup.set("165_BCG", [])
+  groupRowsByGroup.set("OTHER", [])
+
   for (const r of computedRows) {
     const g = groupForBn(r.bn)
+
     const existing = groupMap.get(g)!
     existing.onHand += r.onHand
     existing.remaining += r.remaining
     existing.destroyed += r.destroyed
+
+    groupRowsByGroup.get(g)!.push(r)
   }
 
   const groupSummaries: GroupSummary[] = Array.from(groupMap.values()).map((g) => {
     g.combatPowerPct = g.onHand > 0 ? (g.remaining / g.onHand) * 100 : 0
 
-    // Weighted attrition estimate for group days-to-25 (weights by onHand)
-    const groupRows = computedRows.filter((r) => groupForBn(r.bn) === g.group)
+    const groupRows = groupRowsByGroup.get(g.group) ?? []
     const totalWeight = groupRows.reduce((sum, r) => sum + r.onHand, 0)
     const weightedAttrition =
       totalWeight > 0
